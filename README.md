@@ -1,96 +1,117 @@
 # Odoo AI Agent
 
-> Multi-channel AI Copilot & Business Automation Engine for Odoo 19, built with NestJS and TypeScript.
+Multi-channel AI Copilot & Business Automation Engine for Odoo 19, built with NestJS and TypeScript.
 
 ---
 
-## 🎯 Overview
+## Overview
 
-**Odoo AI Agent** is a modular, provider-agnostic backend orchestrator designed to connect messaging channels (WhatsApp, Telegram, Web Chat) with **Odoo 19** using structured AI tool-calling.
+**Odoo AI Agent** is a modular, provider-agnostic backend orchestrator designed to connect messaging platforms (WhatsApp, Telegram, Web Chat) with **Odoo 19** via structured AI tool-calling.
 
-It acts as the intelligent bridge between end-users and your ERP, ensuring secure, multi-tenant, and controlled execution of business actions.
+It acts as a secure, multi-tenant middleware between end-users and the ERP system, ensuring validated business action execution, granular tenant isolation, and deterministic workflows.
 
+```text
+  [ Messaging Channels ]
+  (WhatsApp / Telegram / Web)
+             │
+             ▼
+    [ Channel Adapter ]
+             │ (Canonical IncomingMessage)
+             ▼
+  [ NestJS Core Engine ]
+             │
+   ┌─────────┴─────────┐
+   ▼                   ▼
+[ AI Providers ]    [ Business Tools ]
+(OpenAI / Claude /         │ (Validation & Policies)
+ Gemini)                   ▼
+                    [ Odoo 19 ERP ]
+                    (Multi-tenant DBs)
 ```
-WhatsApp / Channels  ──► [ Channel Adapter ]
-                               │
-                               ▼
-                       [ NestJS Engine ]
-                               │
-                     ┌─────────┴─────────┐
-                     ▼                   ▼
-             [ AI Providers ]    [ Business Tools ]
-             (OpenAI/Claude/Gemini)      │
-                                         ▼
-                                  [ Odoo 19 ERP ]
-```
 
 ---
 
-## 🧱 Architectural Pillars
+## Architectural Principles
 
-1. **Channel Agnostic:** Inbound messages are mapped to a canonical `IncomingMessage` schema. The core engine never assumes a specific messaging platform.
-2. **AI Provider Agnostic:** Unified `AIProvider` interface allowing seamless switching between OpenAI, Anthropic, Gemini, or local models.
-3. **Controlled Tool Execution:** The LLM cannot execute raw queries on Odoo. All interactions go through typed, validated business tools (`get_stock`, `search_product`, `create_sale`, `create_quotation`).
-4. **Tenant Isolation:** Multi-tenancy is strictly resolved at the gateway layer and never delegated to the LLM.
-5. **Action Guardrails:** Read operations are executed immediately; mutating business actions require explicit human confirmation.
-
----
-
-## 🛠 Tech Stack
-
-- **Framework:** [NestJS](https://nestjs.com/) (TypeScript)
-- **ERP:** [Odoo 19](https://www.odoo.com/) (JSON-2 / External RPC APIs)
-- **Testing:** Vitest & Supertest
-- **Containerization:** Docker
+- **Channel Agnostic:** Inbound messages from diverse providers (WhatsApp Cloud API, Telegram Bot API) are normalized into a unified `IncomingMessage` contract before reaching the core domain.
+- **Provider-Agnostic AI Integration:** Leverages the Strategy Pattern via a decoupled `AIProvider` interface, allowing seamless switching between Anthropic (Claude), OpenAI, Google Gemini, or local models without modifying business logic.
+- **Controlled Tool Execution:** The LLM does not perform direct or arbitrary database queries. Operations are strictly governed by strongly-typed Business Tools (`search_product`, `get_stock`, `create_sale`, `create_quotation`) that validate inputs before invoking Odoo services.
+- **Tenant Isolation:** Multi-tenant resolution is strictly performed at the gateway and authorization layer based on user identity, never inferred or controlled by the language model.
+- **Human-in-the-Loop Safeguards:** Non-destructive operations (read/query) execute automatically; mutating business transactions (order placement, quote issuance) enforce an explicit confirmation flow.
 
 ---
 
-## 🗺 Roadmap
+## Technology Stack
 
-- [x] Initial Architecture & NestJS Scaffolding
-- [ ] Core Engine & Provider Abstractions (`AIProvider`, `ChannelAdapter`)
-- [ ] WhatsApp Webhook Adapter & Inbound Pipeline
-- [ ] Odoo 19 Client Service & Authentication
-- [ ] Business Tools (Products, Inventory, Quotations, Sales)
-- [ ] Two-step Confirmation Flow for Mutating Operations
-- [ ] Message Idempotency & Queue-based Processing
+- **Runtime & Framework:** Node.js (>= 20.x), NestJS 11
+- **Language:** TypeScript (Strict Mode)
+- **ERP Integration:** Odoo 19 (JSON-2 / External RPC APIs)
+- **Testing & Quality:** Vitest, Supertest, ESLint, Oxlint
+- **Infrastructure:** Docker, Nginx Reverse Proxy
 
 ---
 
-## 🚀 Getting Started
+## Implementation Roadmap
+
+### Phase 1: Core Domain & Contracts
+- [x] Initial architecture definition and NestJS project scaffolding
+- [ ] Core interfaces: `AIProvider`, `ChannelAdapter`, `OdooClient`, `BusinessTool`
+- [ ] Multi-tenant context resolution pipeline
+
+### Phase 2: Odoo 19 Client & Business Tools
+- [ ] Odoo 19 JSON-RPC client service with session management
+- [ ] Product and catalog query tools (`search_product`, `get_product_price`)
+- [ ] Inventory availability tools (`get_stock`, `check_stock_availability`)
+- [ ] Commercial transaction tools (`create_quotation`, `create_sale_order`)
+
+### Phase 3: Messaging Adapters & Safety Layer
+- [ ] WhatsApp Cloud API webhook handler and payload mapper
+- [ ] Action confirmation engine for mutating operations
+- [ ] Message deduplication and idempotency layer
+
+---
+
+## Getting Started
 
 ### Prerequisites
 
-- Node.js >= 20.x
-- npm / pnpm
-- Odoo 19 instance (local or remote)
+- Node.js >= 20.0.0
+- npm or pnpm
+- Running Odoo 19 instance (local Docker or remote host)
 
 ### Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/<your-username>/odoo-ai-agent.git
+git clone git@github.com-ankairos:AnkairOs/odoo-ai-agent.git
 cd odoo-ai-agent
 
 # Install dependencies
 npm install
-
-# Run in development mode
-npm run start:dev
 ```
 
-### Running Tests
+### Development
 
 ```bash
-# Unit tests
+# Start in watch mode
+npm run start:dev
+
+# Build for production
+npm run build
+```
+
+### Testing
+
+```bash
+# Run unit tests
 npm run test
 
-# E2E tests
+# Run end-to-end tests
 npm run test:e2e
 ```
 
 ---
 
-## 📄 License
+## License
 
-MIT
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
