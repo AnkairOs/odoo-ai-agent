@@ -126,6 +126,15 @@ Behavior and safeguards:
 - WhatsApp only allows free-form messages within 24 hours of the recipient's last message. The operator must have written to the business number recently to receive notifications. No templates are used.
 - Customers without a phone number in the payload (business-scoped user ID only) are not handled yet.
 
+### AI Triage and Reply Suggestions
+
+Optional AI layer for the relay, built on the Vercel AI SDK (`ai`, `@ai-sdk/deepseek`, `zod`). DeepSeek (`deepseek-flash`) is the first provider; other providers are added as one case in `src/ai/ai-model.factory.ts`. It is off unless `AI_ENABLED=true` and `DEEPSEEK_API_KEY` is set. Customer messages are sent to the AI provider when it is on.
+
+- **Asynchronous processing:** the webhook stores each verified delivery as a SQLite job (with `tenant_id`) and answers `200` immediately. One in-process worker runs jobs in order, resumes interrupted jobs after a restart (up to three attempts), and isolates failing jobs.
+- **Social closings (F1):** when a customer without an open consultation sends a short message (up to 40 characters) that the AI classifies as a pure closing ("gracias", "ok", "👍") with confidence of at least 0.8, the relay answers with a short AI-written sentence and creates no consultation. Replies with digits, currency symbols, several lines or more than 80 characters are replaced with "¡A la orden! 😊". If the reply cannot be sent, the message becomes a consultation.
+- **Reply suggestions (F2):** each operator notification can include `💡 Sugerencia: …`, drafted with two read-only tools scoped server-side: the customer's previous consultations and keyword search over past answers. Replying exactly `ok` (any case) while quoting that notification sends the suggestion verbatim; any other text is relayed literally.
+- **Fallbacks:** a disabled AI, a timeout (`AI_TIMEOUT_MS`, default 8000 per call) or an invalid AI answer keeps the plain consultation flow without a suggestion.
+
 ### Testing
 
 ```bash
