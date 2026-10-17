@@ -1,8 +1,8 @@
 export interface OdooTenantConfig {
   url: string;
   db: string;
-  username: string;
   apiKey: string;
+  username?: string;
 }
 
 export interface OdooProduct {
