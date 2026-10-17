@@ -1,8 +1,13 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  OnApplicationShutdown,
+  OnModuleInit,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { InboundMessage, isInboundMessage } from './kapso-payload.js';
 
 export type ConsultationStatus =
   | 'notifying'
@@ -18,6 +23,12 @@ export interface Consultation {
   customerWaId: string;
   lastCustomerMessageId: string;
   status: ConsultationStatus;
+}
+
+export interface RelayJob {
+  id: number;
+  tenantId: string;
+  messages: InboundMessage[];
 }
 
 interface ConsultationRow {
@@ -53,14 +64,27 @@ const SCHEMA = `
   );
   INSERT OR IGNORE INTO consultation_notifications (message_id, consultation_id)
     SELECT notification_message_id, id FROM consultations WHERE notification_message_id IS NOT NULL;
+  CREATE TABLE IF NOT EXISTS relay_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS relay_jobs_status ON relay_jobs (status, id);
 `;
 
 const OPEN_STATUSES =
   "('notifying', 'notify_failed', 'notify_unknown', 'awaiting_reply')";
 const UNNOTIFIED_STATUSES = "('notifying', 'notify_failed', 'notify_unknown')";
 
+const MAX_JOB_ATTEMPTS = 3;
+
 @Injectable()
-export class RelayStore implements OnModuleInit, OnModuleDestroy {
+export class RelayStore implements OnModuleInit, OnApplicationShutdown {
   private db: DatabaseSync;
 
   constructor(private readonly configService: ConfigService) {}
@@ -89,7 +113,7 @@ export class RelayStore implements OnModuleInit, OnModuleDestroy {
     `);
   }
 
-  onModuleDestroy() {
+  onApplicationShutdown() {
     this.db?.close();
   }
 
@@ -214,6 +238,89 @@ export class RelayStore implements OnModuleInit, OnModuleDestroy {
         'UPDATE consultations SET status = ?, reply_message_id = ?, last_error = ?, updated_at = ? WHERE id = ?',
       )
       .run(status, replyMessageId ?? null, error ?? null, now(), id);
+  }
+
+  enqueueJob(tenantId: string, messages: InboundMessage[]): number {
+    const timestamp = now();
+    const result = this.db
+      .prepare(
+        `INSERT INTO relay_jobs (tenant_id, payload, status, created_at, updated_at)
+         VALUES (?, ?, 'pending', ?, ?)`,
+      )
+      .run(tenantId, JSON.stringify(messages), timestamp, timestamp);
+    return Number(result.lastInsertRowid);
+  }
+
+  claimNextJob(): RelayJob | undefined {
+    for (;;) {
+      const row = this.claimNextJobRow();
+      if (!row) {
+        return undefined;
+      }
+      const messages = decodeMessages(row.payload);
+      if (messages) {
+        return { id: row.id, tenantId: row.tenant_id, messages };
+      }
+      this.failJob(row.id, 'invalid payload');
+    }
+  }
+
+  private claimNextJobRow(): JobRow | undefined {
+    return this.db
+      .prepare(
+        `UPDATE relay_jobs SET status = 'processing', attempts = attempts + 1, updated_at = ?
+         WHERE id = (SELECT id FROM relay_jobs WHERE status = 'pending' ORDER BY id LIMIT 1)
+         RETURNING id, tenant_id, payload`,
+      )
+      .get(now()) as JobRow | undefined;
+  }
+
+  completeJob(id: number) {
+    this.db
+      .prepare(
+        "UPDATE relay_jobs SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?",
+      )
+      .run(now(), id);
+  }
+
+  failJob(id: number, error: string) {
+    this.db
+      .prepare(
+        "UPDATE relay_jobs SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?",
+      )
+      .run(error, now(), id);
+  }
+
+  resumeInterruptedJobs() {
+    const timestamp = now();
+    this.db
+      .prepare(
+        `UPDATE relay_jobs SET status = 'failed', last_error = 'interrupted too many times', updated_at = ?
+         WHERE status = 'processing' AND attempts >= ?`,
+      )
+      .run(timestamp, MAX_JOB_ATTEMPTS);
+    this.db
+      .prepare(
+        "UPDATE relay_jobs SET status = 'pending', updated_at = ? WHERE status = 'processing'",
+      )
+      .run(timestamp);
+  }
+}
+
+interface JobRow {
+  id: number;
+  tenant_id: string;
+  payload: string;
+}
+
+function decodeMessages(payload: string): InboundMessage[] | undefined {
+  try {
+    const value: unknown = JSON.parse(payload);
+    return Array.isArray(value) && value.every(isInboundMessage)
+      ? value
+      : undefined;
+  } catch {
+    return undefined;
   }
 }
 

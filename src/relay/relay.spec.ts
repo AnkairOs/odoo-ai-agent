@@ -8,7 +8,9 @@ import { INestApplication } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
+import { RelayJobProcessor } from './relay-job.processor.js';
 import { RelayModule } from './relay.module.js';
+import { RelayStore } from './relay.store.js';
 import {
   OutgoingText,
   SendResult,
@@ -25,13 +27,37 @@ const CUSTOMER_B = '15550002222';
 class FakeSender implements WhatsAppSender {
   readonly sent: OutgoingText[] = [];
   private queued: SendResult[] = [];
+  private gates: Promise<void>[] = [];
+  private crashes = 0;
   private counter = 0;
 
   failNext(result: SendResult) {
     this.queued.push(result);
   }
 
+  throwNext() {
+    this.crashes += 1;
+  }
+
+  holdNext(): () => void {
+    let release = () => {};
+    this.gates.push(
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    return release;
+  }
+
   async sendText(message: OutgoingText): Promise<SendResult> {
+    const gate = this.gates.shift();
+    if (gate) {
+      await gate;
+    }
+    if (this.crashes > 0) {
+      this.crashes -= 1;
+      throw new Error('sender exploded');
+    }
     const forced = this.queued.shift();
     if (forced) {
       return forced;
@@ -86,6 +112,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
   let dbPath: string;
   let app: INestApplication;
   let sender: FakeSender;
+  let jobs: RelayJobProcessor;
 
   async function start() {
     sender = new FakeSender();
@@ -112,9 +139,24 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       .compile();
     app = moduleRef.createNestApplication({ rawBody: true });
     await app.init();
+    jobs = app.get(RelayJobProcessor);
   }
 
   function deliver(
+    payload: unknown,
+    event = 'whatsapp.message.received',
+    secret = SECRET,
+  ) {
+    const response = post(payload, event, secret);
+    return {
+      async expect(status: number) {
+        await response.expect(status);
+        await jobs.whenIdle();
+      },
+    };
+  }
+
+  function post(
     payload: unknown,
     event = 'whatsapp.message.received',
     secret = SECRET,
@@ -146,6 +188,19 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
   function notificationId(notification: OutgoingText): string {
     const index = sender.sent.indexOf(notification);
     return `wamid.OUT${index + 1}`;
+  }
+
+  function storedJobs() {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      return db
+        .prepare(
+          'SELECT tenant_id, status, attempts, last_error FROM relay_jobs ORDER BY id',
+        )
+        .all();
+    } finally {
+      db.close();
+    }
   }
 
   beforeEach(async () => {
@@ -537,6 +592,124 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       'No sé si la respuesta a la consulta #1 llegó (timeout). Verifica en Kapso antes de volver a escribirle; no se reintentará automáticamente.',
       'La consulta #1 tiene un envío con resultado incierto. Verifica en Kapso; no se envió nada.',
     ]);
+  });
+
+  describe('background processing', () => {
+    it('acknowledges the webhook before the notification is sent', async () => {
+      const release = sender.holdNext();
+
+      await post(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'hola' }),
+      ).expect(200);
+      expect(sender.sent).toEqual([]);
+
+      release();
+      await jobs.whenIdle();
+      expect(notificationFor('hola').body).toContain('Consulta #1');
+    });
+
+    it('processes deliveries one at a time in arrival order', async () => {
+      const release = sender.holdNext();
+
+      await post(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'primero' }),
+      ).expect(200);
+      await post(
+        inbound({ id: 'wamid.B1', from: CUSTOMER_B, body: 'segundo' }),
+      ).expect(200);
+      expect(sender.sent).toEqual([]);
+
+      release();
+      await jobs.whenIdle();
+      expect(sender.to(OPERATOR).map((m) => m.body.split('\n')[2])).toEqual([
+        'primero',
+        'segundo',
+      ]);
+    });
+
+    it('resumes jobs left pending or processing when the app restarts', async () => {
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'ya avisado' }),
+      ).expect(200);
+      const store = app.get(RelayStore);
+      store.enqueueJob('default', [
+        {
+          id: 'wamid.B1',
+          phoneNumberId: BUSINESS_PHONE_ID,
+          from: CUSTOMER_B,
+          contactName: 'Beto',
+          type: 'text',
+          text: 'interrumpido',
+        },
+      ]);
+      store.claimNextJob();
+      store.enqueueJob('default', [
+        {
+          id: 'wamid.B2',
+          phoneNumberId: BUSINESS_PHONE_ID,
+          from: CUSTOMER_B,
+          contactName: 'Beto',
+          type: 'text',
+          text: 'pendiente',
+        },
+      ]);
+      await app.close();
+
+      await start();
+      await jobs.whenIdle();
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'ya avisado' }),
+      ).expect(200);
+
+      expect(sender.to(OPERATOR).map((m) => m.body)).toEqual([
+        'Consulta #2 · Beto (…2222)\n\ninterrumpido\n\nResponde citando este mensaje para contestarle.',
+        'Consulta #2 (continúa) · Beto (…2222)\n\npendiente\n\nResponde citando este mensaje para contestarle.',
+      ]);
+      expect(storedJobs().map((job) => job.status)).toEqual([
+        'done',
+        'done',
+        'done',
+        'done',
+      ]);
+    });
+
+    it('marks a throwing job as failed and keeps processing later deliveries', async () => {
+      sender.throwNext();
+
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'explota' }),
+      ).expect(200);
+      await deliver(
+        inbound({ id: 'wamid.B1', from: CUSTOMER_B, body: 'sigue' }),
+      ).expect(200);
+
+      expect(sender.sent).toEqual([
+        expect.objectContaining({
+          to: OPERATOR,
+          body: expect.stringContaining('sigue'),
+        }),
+      ]);
+      expect(storedJobs()).toEqual([
+        {
+          tenant_id: 'default',
+          status: 'failed',
+          attempts: 1,
+          last_error: 'sender exploded',
+        },
+        { tenant_id: 'default', status: 'done', attempts: 1, last_error: null },
+      ]);
+    });
+
+    it('creates no job for an invalid signature', async () => {
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'hola' }),
+        'whatsapp.message.received',
+        'wrong',
+      ).expect(401);
+
+      expect(storedJobs()).toEqual([]);
+      expect(sender.sent).toEqual([]);
+    });
   });
 
   describe('multi-message customers', () => {
