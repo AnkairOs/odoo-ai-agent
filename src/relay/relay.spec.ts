@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { INestApplication } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
@@ -25,6 +25,7 @@ import {
   WhatsAppSender,
 } from './whatsapp-sender.js';
 
+const ROUTES = 'Cita este mensaje: "ok" envía este borrador; otra instrucción pide un borrador privado; /enviar <texto> envía texto literal sin IA.';
 const SECRET = 'test-webhook-secret';
 const BUSINESS_PHONE_ID = '100000000000001';
 const OPERATOR = '15550000001';
@@ -311,7 +312,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
     expect(sender.sent).toEqual([
       {
         to: OPERATOR,
-        body: 'Consulta #1 · Ana (…1111)\n\n¿Tienen talla M?\n\nResponde citando este mensaje para contestarle.',
+        body: `Consulta #1 · Ana (…1111)\n\n¿Tienen talla M?\n\nSin borrador disponible. ${ROUTES}`,
       },
     ]);
   });
@@ -326,7 +327,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       inbound({
         id: 'wamid.OP1',
         from: OPERATOR,
-        body: literal,
+        body: `/enviar ${literal}`,
         contextId: notificationId(notificationFor('¿Precio?')),
       }),
     ).expect(200);
@@ -349,7 +350,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       inbound({
         id: 'wamid.OP1',
         from: OPERATOR,
-        body: 'respuesta B',
+        body: '/enviar respuesta B',
         contextId: notificationId(notificationFor('pregunta B')),
       }),
     ).expect(200);
@@ -376,7 +377,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
     const reply = inbound({
       id: 'wamid.OP1',
       from: OPERATOR,
-      body: 'buenas',
+      body: '/enviar buenas',
       contextId: notificationId(notificationFor('hola')),
     });
 
@@ -396,7 +397,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       inbound({
         id: 'wamid.OP1',
         from: OPERATOR,
-        body: 'primera',
+        body: '/enviar primera',
         contextId: quoted,
       }),
     ).expect(200);
@@ -405,7 +406,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       inbound({
         id: 'wamid.OP2',
         from: OPERATOR,
-        body: 'segunda',
+        body: '/enviar segunda',
         contextId: quoted,
       }),
     ).expect(200);
@@ -416,7 +417,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
     );
   });
 
-  it('never relays a quoted reply from someone other than the operator', async () => {
+  it.each(['mensaje intruso', '/enviar autorizado', 'ok'])('never authorizes a non-operator quote: %s', async (body) => {
     await deliver(
       inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'hola' }),
     ).expect(200);
@@ -426,13 +427,13 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       inbound({
         id: 'wamid.B1',
         from: CUSTOMER_B,
-        body: 'mensaje intruso',
+        body,
         contextId: quoted,
       }),
     ).expect(200);
 
     expect(sender.to(CUSTOMER_A)).toEqual([]);
-    expect(notificationFor('mensaje intruso').body).toContain('Consulta #2');
+    expect(sender.to(OPERATOR).at(-1)?.body).toContain(`Consulta #2 · Cliente (…2222)\n\n${body}`);
   });
 
   it.each([
@@ -493,7 +494,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       inbound({
         id: 'wamid.OP1',
         from: OPERATOR,
-        body: 'después',
+        body: '/enviar después',
         contextId: quoted,
       }),
     ).expect(200);
@@ -526,7 +527,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       inbound({
         id: 'wamid.OP1',
         from: OPERATOR,
-        body: 'respuesta',
+        body: '/enviar respuesta',
         contextId: 'wamid.LEGACY',
       }),
     ).expect(200);
@@ -621,7 +622,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       inbound({
         id: 'wamid.OP1',
         from: OPERATOR,
-        body: 'intento 1',
+        body: '/enviar intento 1',
         contextId: quoted,
       }),
     ).expect(200);
@@ -632,7 +633,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       inbound({
         id: 'wamid.OP2',
         from: OPERATOR,
-        body: 'intento 2',
+        body: '/enviar intento 2',
         contextId: quoted,
       }),
     ).expect(200);
@@ -653,7 +654,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       inbound({
         id: 'wamid.OP1',
         from: OPERATOR,
-        body: 'intento 1',
+        body: '/enviar intento 1',
         contextId: quoted,
       }),
     ).expect(200);
@@ -661,7 +662,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       inbound({
         id: 'wamid.OP2',
         from: OPERATOR,
-        body: 'intento 2',
+        body: '/enviar intento 2',
         contextId: quoted,
       }),
     ).expect(200);
@@ -746,8 +747,8 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       ).expect(200);
 
       expect(sender.to(OPERATOR).map((m) => m.body)).toEqual([
-        'Consulta #2 · Beto (…2222)\n\ninterrumpido\n\nResponde citando este mensaje para contestarle.',
-        'Consulta #2 (continúa) · Beto (…2222)\n\npendiente\n\nResponde citando este mensaje para contestarle.',
+        `Consulta #2 · Beto (…2222)\n\ninterrumpido\n\nSin borrador disponible. ${ROUTES}`,
+        `Consulta #2 (continúa) · Beto (…2222)\n\npendiente\n\nSin borrador disponible. ${ROUTES}`,
       ]);
       expect(storedJobs().map((job) => job.status)).toEqual([
         'done',
@@ -824,9 +825,9 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       ).expect(200);
 
       expect(sender.to(OPERATOR).map((m) => m.body)).toEqual([
-        'Consulta #1 · Ana (…1111)\n\nHola\n\nResponde citando este mensaje para contestarle.',
-        'Consulta #1 (continúa) · Ana (…1111)\n\nuna recarga de $5\n\nResponde citando este mensaje para contestarle.',
-        'Consulta #2 · Beto (…2222)\n\notra cosa\n\nResponde citando este mensaje para contestarle.',
+        `Consulta #1 · Ana (…1111)\n\nHola\n\nSin borrador disponible. ${ROUTES}`,
+        `Consulta #1 (continúa) · Ana (…1111)\n\nuna recarga de $5\n\nSin borrador disponible. ${ROUTES}`,
+        `Consulta #2 · Beto (…2222)\n\notra cosa\n\nSin borrador disponible. ${ROUTES}`,
       ]);
     });
 
@@ -844,7 +845,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
         inbound({
           id: 'wamid.OP1',
           from: OPERATOR,
-          body: 'Claro, ¿de cuánto?',
+          body: '/enviar Claro, ¿de cuánto?',
           contextId: continuation,
         }),
       ).expect(200);
@@ -852,7 +853,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
         inbound({
           id: 'wamid.OP2',
           from: OPERATOR,
-          body: 'otra',
+          body: '/enviar otra',
           contextId: first,
         }),
       ).expect(200);
@@ -887,7 +888,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
         inbound({
           id: 'wamid.OP1',
           from: OPERATOR,
-          body: 'Listo',
+          body: '/enviar Listo',
           contextId: notificationId(notificationFor('Hola')),
         }),
       ).expect(200);
@@ -905,7 +906,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
         inbound({
           id: 'wamid.OP1',
           from: OPERATOR,
-          body: 'Dime',
+          body: '/enviar Dime',
           contextId: notificationId(notificationFor('Hola')),
         }),
       ).expect(200);
@@ -948,7 +949,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       await deliver(batch).expect(200);
 
       expect(sender.to(OPERATOR).map((m) => m.body)).toEqual([
-        'Consulta #1 · Ana (…1111)\n\nHola\nbuenas\nuna recarga de...\n\nResponde citando este mensaje para contestarle.',
+        `Consulta #1 · Ana (…1111)\n\nHola\nbuenas\nuna recarga de...\n\nSin borrador disponible. ${ROUTES}`,
       ]);
     });
 
@@ -965,7 +966,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
         inbound({
           id: 'wamid.OP1',
           from: OPERATOR,
-          body: 'Listo',
+          body: '/enviar Listo',
           contextId: notificationId(notificationFor('una recarga')),
         }),
       ).expect(200);
@@ -1104,6 +1105,154 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       );
     });
   });
+  describe('private operator copilot', () => {
+    async function say(id: string, body: string, contextId: string) {
+      await deliver(inbound({ id, from: OPERATOR, body, contextId })).expect(200);
+    }
+
+    it.each(['  /enviar   Sí 😊\nOtra línea.  ', '/enviar\nTexto\nfinal\n'])('preserves literal payload and bypasses disabled AI: %s', async (command) => {
+      await deliver(inbound({ id: 'A1', from: CUSTOMER_A, body: 'precio' })).expect(200);
+      await say('OP1', command, notificationId(notificationFor('precio')));
+      const payload = command.trimStart().slice('/enviar'.length + 1);
+      expect(sender.to(CUSTOMER_A)).toEqual([
+        { to: CUSTOMER_A, body: payload, contextMessageId: 'A1' },
+      ]);
+      expect(ai.toolCalls).toEqual([]);
+      expect(ai.structuredCalls).toEqual([]);
+    });
+
+    it.each(['/enviar', '  /enviar   \n', 'ok', ' OK '])('keeps empty commands and approvals without a draft private: %s', async (body) => {
+      await deliver(inbound({ id: 'A1', from: CUSTOMER_A, body: 'precio' })).expect(200);
+      await say('OP1', body, notificationId(notificationFor('precio')));
+      expect(sender.to(CUSTOMER_A)).toEqual([]);
+      expect(sender.to(OPERATOR).at(-1)?.body).toContain('No se envió nada');
+      expect(app.get(RelayStore).getStatus(1)).toBe('awaiting_reply');
+      expect(ai.toolCalls).toEqual([]);
+    });
+
+    it.each(['/enviarme texto', 'dile /enviar texto', 'ok, pero mañana'])('treats non-command text as a private instruction: %s', async (body) => {
+      await deliver(inbound({ id: 'A1', from: CUSTOMER_A, body: 'precio' })).expect(200);
+      ai.enabled = true;
+      ai.suggest(suggestion('Propuesta'));
+      await say('OP1', body, notificationId(notificationFor('precio')));
+      expect(sender.to(CUSTOMER_A)).toEqual([]);
+      expect(JSON.parse(String(ai.toolCalls[0]?.messages[0]?.content))).toEqual({
+        question: 'precio', instruction: body,
+      });
+      expect(sender.to(OPERATOR).at(-1)?.body).toContain('Propuesta');
+    });
+
+    it.each(['disabled', 'timeout', 'provider_error', 'empty', 'oversized', 'throws'])('never sends an instruction when AI is %s', async (mode) => {
+      await deliver(inbound({ id: 'A1', from: CUSTOMER_A, body: 'precio' })).expect(200);
+      ai.enabled = mode !== 'disabled';
+      if (mode === 'timeout' || mode === 'provider_error') {
+        ai.suggest({ ok: false, reason: mode, detail: 'unavailable' });
+      } else if (mode === 'throws') {
+        vi.spyOn(ai, 'generateWithTools').mockRejectedValueOnce(new Error('failure'));
+      } else {
+        ai.suggest(suggestion(mode === 'empty' ? '  ' : 'x'.repeat(601)));
+      }
+      await say('OP1', 'Dile que está a $6', notificationId(notificationFor('precio')));
+      expect(sender.to(CUSTOMER_A)).toEqual([]);
+      expect(sender.to(OPERATOR).at(-1)?.body).toContain('No pude preparar el borrador');
+      expect(app.get(RelayStore).getStatus(1)).toBe('awaiting_reply');
+      expect(app.get(RelayStore).customerHistory(CUSTOMER_A, 0)[0]?.reply).toBeNull();
+    });
+
+    it('isolates customers, rejects stale approval, but allows stale revision and literal send', async () => {
+      await deliver(inbound({ id: 'A1', from: CUSTOMER_A, body: '400 Robux' })).expect(200);
+      const a = notificationId(notificationFor('400 Robux'));
+      await deliver(inbound({ id: 'B1', from: CUSTOMER_B, body: 'otro producto' })).expect(200);
+      const b = notificationId(notificationFor('otro producto'));
+      ai.enabled = true;
+      ai.suggest(suggestion('Robux a $6'));
+      await say('OP1', 'Dile que está a $6', a);
+      const first = notificationId(sender.to(OPERATOR).at(-1)!);
+      ai.suggest(suggestion('Con gusto, Robux a $6'));
+      await say('OP2', 'Más amable', first);
+      const current = notificationId(sender.to(OPERATOR).at(-1)!);
+      await say('STALE', 'ok', first);
+      expect(sender.to(OPERATOR).at(-1)?.body).toContain('reemplazado');
+      expect(sender.to(CUSTOMER_A)).toEqual([]);
+      ai.suggest(suggestion('Otro borrador'));
+      await say('REV', 'Más breve', first);
+      expect(JSON.parse(String(ai.toolCalls.at(-1)?.messages[0]?.content))).toEqual({
+        question: '400 Robux', quotedDraft: 'Robux a $6', instruction: 'Más breve',
+      });
+      ai.suggest(suggestion('Respuesta B'));
+      await say('BOP', 'Contesta', b);
+      expect(JSON.stringify(ai.toolCalls.at(-1)?.messages)).not.toContain('Robux');
+      expect(await runTool(ai.toolCalls.at(-1), 'get_customer_history', {})).toEqual([]);
+      expect(await runTool(ai.toolCalls.at(-1), 'search_past_answers', { query: 'Robux' })).toEqual([]);
+      const calls = ai.toolCalls.length;
+      await say('SEND', '/enviar literal A', current);
+      expect(ai.toolCalls).toHaveLength(calls);
+      expect(sender.to(CUSTOMER_A).map((m) => m.body)).toEqual(['literal A']);
+      expect(sender.to(CUSTOMER_B)).toEqual([]);
+    });
+
+    it('does not supersede a visible draft when the private proposal send is uncertain', async () => {
+      ai.enabled = true;
+      ai.suggest(suggestion('Inicial'));
+      await deliver(inbound({ id: 'A1', from: CUSTOMER_A, body: '400 Robux' })).expect(200);
+      const initial = notificationId(notificationFor('400 Robux'));
+      ai.suggest(suggestion('No confirmado como visible'));
+      sender.failNext({ kind: 'unknown', reason: 'timeout' });
+      await say('REV', 'Más amable', initial);
+      expect(app.get(RelayStore).getStatus(1)).toBe('awaiting_reply');
+      await say('OK', 'ok', initial);
+      expect(sender.to(CUSTOMER_A).map((m) => m.body)).toEqual(['Inicial']);
+    });
+
+    it('drafts and revises privately, persists the visible draft, then approves exactly once', async () => {
+      ai.enabled = true;
+      ai.suggest(suggestion('Déjame confirmar el precio.'));
+      await deliver(inbound({ id: 'A1', from: CUSTOMER_A, body: '400' })).expect(200);
+      await deliver(inbound({ id: 'A2', from: CUSTOMER_A, body: 'Robux' })).expect(200);
+      const quoted = notificationId(notificationFor('400'));
+      const draft = 'La recarga de 400 Robux cuesta $6.';
+      ai.suggest(suggestion(draft));
+      await say('OP1', 'Dile que está a $6', quoted);
+      expect(sender.to(CUSTOMER_A)).toEqual([]);
+      expect(sender.to(OPERATOR).at(-1)?.body).toContain(draft);
+      const store = app.get(RelayStore);
+      expect(store.getStatus(1)).toBe('awaiting_reply');
+      expect(store.customerHistory(CUSTOMER_A, 0)[0]?.reply).toBeNull();
+      expect(store.searchPastAnswers(['Robux'])).toEqual([]);
+      expect(ai.toolCalls.at(-1)?.messages).toEqual([
+        { role: 'user', content: JSON.stringify({ question: '400\nRobux', quotedDraft: 'Déjame confirmar el precio.', instruction: 'Dile que está a $6' }) },
+      ]);
+      expect(ai.toolCalls.at(-1)?.system).toContain('stock');
+      expect(ai.toolCalls.at(-1)?.system).toContain('discounts');
+      const draftId = notificationId(sender.to(OPERATOR).at(-1)!);
+      await say('OP1', 'Dile que está a $6', quoted);
+      expect(ai.toolCalls).toHaveLength(3);
+      const revised = '¡Con gusto! 😊 La recarga de 400 Robux cuesta $6.';
+      ai.suggest(suggestion(revised));
+      await say('OP2', 'Hazlo más amable', draftId);
+      expect(JSON.parse(String(ai.toolCalls.at(-1)?.messages[0]?.content))).toEqual({
+        question: '400\nRobux', quotedDraft: draft, instruction: 'Hazlo más amable',
+      });
+      expect(sender.to(CUSTOMER_A)).toEqual([]);
+      expect(store.getStatus(1)).toBe('awaiting_reply');
+      const revisedId = notificationId(sender.to(OPERATOR).at(-1)!);
+      await say('STALE', 'ok', draftId);
+      expect(sender.to(CUSTOMER_A)).toEqual([]);
+      await app.close();
+      await start();
+      await say('OP3', ' OK ', revisedId);
+      await say('OP3', ' OK ', revisedId);
+      expect(sender.to(CUSTOMER_A)).toEqual([
+        { to: CUSTOMER_A, body: revised, contextMessageId: 'A2' },
+      ]);
+      expect(app.get(RelayStore).searchPastAnswers(['robux'])).toEqual([
+        { question: '400\nRobux', reply: revised },
+      ]);
+      await say('AFTER', '/enviar otra', quoted);
+      expect(sender.to(CUSTOMER_A)).toHaveLength(1);
+    });
+  });
+
   describe('F2 reply suggestions', () => {
     const SUGGESTED = 'Sí, tenemos recargas de $10 😊';
 
@@ -1136,7 +1285,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       await askWithSuggestion('wamid.A1', '¿Hay recargas de $10?', SUGGESTED);
 
       expect(sender.to(OPERATOR).map((m) => m.body)).toEqual([
-        `Consulta #1 · Ana (…1111)\n\n¿Hay recargas de $10?\n\n💡 Sugerencia: ${SUGGESTED}\n\nResponde "ok" citando este mensaje para enviar la sugerencia, o escribe tu propia respuesta.`,
+        `Consulta #1 · Ana (…1111)\n\n¿Hay recargas de $10?\n\n💡 Sugerencia: ${SUGGESTED}\n\n${ROUTES}`,
       ]);
       expect(JSON.stringify(ai.toolCalls[0]?.messages)).toContain(
         '¿Hay recargas de $10?',
@@ -1168,7 +1317,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       await askWithSuggestion('wamid.A1', firstQuestion, SUGGESTED);
       await operatorSays(
         'wamid.OP1',
-        firstReply,
+        `/enviar ${firstReply}`,
         notificationId(notificationFor(firstQuestion)),
       );
       await askWithSuggestion('wamid.A2', secondQuestion, SUGGESTED);
@@ -1179,7 +1328,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       ]);
       await operatorSays(
         'wamid.OP2',
-        secondReply,
+        `/enviar ${secondReply}`,
         notificationId(notificationFor(secondQuestion)),
       );
       await askWithSuggestion('wamid.A3', currentQuestion, 'Mañana te confirmo');
@@ -1214,7 +1363,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       sender.failNext({ kind: 'unknown', reason: 'timeout' });
       await operatorSays(
         'wamid.OP1',
-        'Sí, confirmado',
+        '/enviar Sí, confirmado',
         notificationId(notificationFor('¿Hay recargas?')),
       );
       await askWithSuggestion('wamid.A2', '¿Y de $5?', SUGGESTED);
@@ -1240,7 +1389,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       await askWithSuggestion('wamid.A1', '¿Hay?', `  ${SUGGESTED}\n `);
 
       expect(notificationFor('¿Hay?').body).toContain(
-        `💡 Sugerencia: ${SUGGESTED}\n\nResponde "ok"`,
+        `💡 Sugerencia: ${SUGGESTED}\n\nCita este mensaje`,
       );
     });
 
@@ -1261,12 +1410,12 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       },
     );
 
-    it('relays any other operator text literally', async () => {
+    it('relays explicit /enviar text literally', async () => {
       await askWithSuggestion('wamid.A1', '¿Hay recargas?', SUGGESTED);
 
       await operatorSays(
         'wamid.OP1',
-        'ok, pero mañana',
+        '/enviar ok, pero mañana',
         notificationId(notificationFor('¿Hay recargas?')),
       );
 
@@ -1284,7 +1433,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       ['an empty suggestion', '   '],
       ['a suggestion over 600 characters', 'a'.repeat(601)],
     ])(
-      'keeps the plain notification and relays "ok" literally after %s',
+      'keeps the plain notification and refuses approval after %s',
       async (_label, text) => {
         await askWithSuggestion('wamid.A1', '¿Hay recargas?', text);
 
@@ -1295,11 +1444,10 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
         );
 
         expect(notificationFor('¿Hay recargas?').body).toBe(
-          'Consulta #1 · Ana (…1111)\n\n¿Hay recargas?\n\nResponde citando este mensaje para contestarle.',
+          `Consulta #1 · Ana (…1111)\n\n¿Hay recargas?\n\nSin borrador disponible. ${ROUTES}`,
         );
-        expect(sender.to(CUSTOMER_A)).toEqual([
-          { to: CUSTOMER_A, body: 'ok', contextMessageId: 'wamid.A1' },
-        ]);
+        expect(sender.to(CUSTOMER_A)).toEqual([]);
+        expect(sender.to(OPERATOR).at(-1)?.body).toContain('No hay un borrador');
       },
     );
 
@@ -1375,7 +1523,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
         await askWithSuggestion(id, question, undefined, { from });
         await operatorSays(
           `${id}.OP`,
-          reply,
+          `/enviar ${reply}`,
           notificationId(notificationFor(question)),
         );
       }
@@ -1461,13 +1609,13 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       legacy.close();
       await start();
 
-      await operatorSays('wamid.OP1', 'ok', 'wamid.LEGACY');
+      await operatorSays('wamid.OP1', '/enviar respuesta', 'wamid.LEGACY');
       await askWithSuggestion('wamid.B1', '¿recargas?', SUGGESTED, {
         from: CUSTOMER_B,
       });
 
       expect(sender.to(CUSTOMER_A)).toEqual([
-        { to: CUSTOMER_A, body: 'ok', contextMessageId: 'wamid.A1' },
+        { to: CUSTOMER_A, body: 'respuesta', contextMessageId: 'wamid.A1' },
       ]);
       expect(notificationFor('¿recargas?').body).toContain(
         `💡 Sugerencia: ${SUGGESTED}`,
@@ -1476,7 +1624,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
         await runTool(ai.toolCalls.at(-1), 'search_past_answers', {
           query: 'recargas',
         }),
-      ).toEqual([{ question: 'recargas viejas', reply: 'ok' }]);
+      ).toEqual([{ question: 'recargas viejas', reply: 'respuesta' }]);
     });
   });
 });

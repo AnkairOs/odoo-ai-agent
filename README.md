@@ -109,19 +109,26 @@ npm run build
 
 ### WhatsApp Operator Relay (MVP)
 
-A human-in-the-loop relay with no AI or Odoo involved:
+A human-in-the-loop relay with optional private AI drafting (no Odoo calls):
 
 1. A customer writes to the business WhatsApp number (Kapso).
-2. The operator's personal WhatsApp receives `Consulta #N` with the exact customer text.
-3. The operator answers by **quoting (swiping) that notification**.
-4. The operator's text is sent **literally** to that customer, quoting the original question.
+2. The operator's personal WhatsApp receives `Consulta #N` with the exact customer text and an optional suggestion.
+3. The configured operator **quotes (swipes) a consultation notification or private draft** and chooses:
+   - **Private instruction**, e.g. `Dile que está a $6` or `Hazlo más amable`: AI returns a proposed customer message only to the operator. Nothing is sent to the customer and the consultation stays open.
+   - **`ok`** (trimmed, case-insensitive): sends the exact draft shown in the quoted message, only if it is still the current notification. The initial suggestion also counts as a visible draft. Superseded approvals and `ok` without a draft send nothing.
+   - **`/enviar <texto>`**: sends the payload literally, bypassing AI, including when AI is disabled.
+4. A customer send quotes their **latest** message and closes the consultation only on confirmed success.
+
+Example: customer asks for 400 Robux → operator quotes the consultation with `Dile que está a $6` → private proposal `La recarga de 400 Robux cuesta $6.` → operator quotes it with `Hazlo más amable` → new private proposal → operator quotes that proposal with `ok` → that exact text reaches the customer once. These are illustrative AI phrases, not guaranteed wording.
+
+`/enviar` must be the first exact command token (optional leading whitespace). The command and **one whitespace separator** are removed; all remaining spaces, punctuation and newlines are preserved. `/enviar` with no non-whitespace payload gives private usage guidance. `/enviarme` and embedded `/enviar` are ordinary drafting instructions. Every route requires a valid quote; there is no unquoted send mode.
 
 Behavior and safeguards:
 
 - Only `whatsapp.message.received` events signed with `KAPSO_WEBHOOK_SECRET` and addressed to `KAPSO_PHONE_NUMBER_ID` are processed. Other events are acknowledged and ignored.
 - Each WhatsApp message id is processed at most once, so redeliveries and retries have no further effect. Consultations persist in SQLite (`RELAY_DB_PATH`, built-in `node:sqlite`, Node.js >= 22.13).
 - Only messages from `RELAY_OPERATOR_WA_ID` can answer. A quote from anyone else becomes a new consultation.
-- A customer has at most one open consultation. Until the operator replies, further messages from that customer are added to it and forwarded as `Consulta #N (continúa)`; the operator may quote any of those notifications. After the reply, the customer's next message opens a new consultation.
+- A customer has at most one open consultation. Until the operator replies, further messages from that customer are added to it and forwarded as `Consulta #N (continúa)`; the operator may quote older notifications for revision or `/enviar`, but cannot approve a superseded draft. After the reply, the customer's next message opens a new consultation.
 - With Kapso buffering enabled on the webhook (`--buffer-enabled --buffer-window-seconds 10`), a burst of messages from one customer arrives as one batch and is forwarded as a single notification.
 - Each consultation accepts one reply. Unknown or missing quotes, non-text replies and repeated replies are refused, and the operator is told nothing was sent.
 - If Kapso definitely rejects a send, the operator may retry. If the outcome is uncertain (network error, 5xx), the consultation is blocked and never retried automatically.
@@ -134,8 +141,9 @@ Optional AI layer for the relay, built on the Vercel AI SDK (`ai`, `@ai-sdk/deep
 
 - **Asynchronous processing:** the webhook stores each verified delivery as a SQLite job (with `tenant_id`) and answers `200` immediately. One in-process worker runs jobs in order, resumes interrupted jobs after a restart (up to three attempts), and isolates failing jobs.
 - **Social closings (F1):** when a customer without an open consultation sends a short message (up to 40 characters) that the AI classifies as a pure closing ("gracias", "ok", "👍") with confidence of at least 0.8, the relay answers with a short AI-written sentence and creates no consultation. Replies with digits, currency symbols, several lines or more than 80 characters are replaced with "¡A la orden! 😊". If the reply cannot be sent, the message becomes a consultation.
-- **Reply suggestions (F2):** each operator notification can include `💡 Sugerencia: …`, drafted with two read-only tools scoped server-side: the customer's previous consultations and keyword search over past answers. Recent exchanges from the same customer are also passed directly to the AI, with instructions to avoid repeated greetings in ongoing conversations (a first contact may greet). Replying exactly `ok` (any case) while quoting that notification sends the suggestion verbatim; any other text is relayed literally.
-- **Fallbacks:** a disabled AI, a timeout (`AI_TIMEOUT_MS`, default 8000 per call) or an invalid AI answer keeps the plain consultation flow without a suggestion.
+- **Reply suggestions (F2):** each operator notification can include `💡 Sugerencia: …`, drafted with two read-only tools scoped server-side: the customer's previous consultations and keyword search over past answers. Recent exchanges from the same customer are also passed directly to the AI, with instructions to avoid repeated greetings in ongoing conversations (a first contact may greet). Replying exactly `ok` (trimmed, any case) while quoting the current notification sends the suggestion verbatim. Ordinary operator text instead requests a private draft or revision using the full current consultation, the exact quoted draft and the operator instruction. Successful private proposals are persisted in the existing notification mapping, so they can be revised or approved after a restart; they are not recorded as customer replies.
+- **Facts and privacy:** prompts forbid inventing stock, delivery times, discounts or promises from a price instruction. This is prompt guidance, not a factual guarantee: the operator must review the draft. Private instructions and unsent drafts are not customer history or searchable past answers; when enabled, AI receives the instruction and draft as context. Confirmed sent answers remain retrievable, not model training or permanent approved business knowledge. No unbounded operator chat history is kept.
+- **Fallbacks:** a disabled AI, a timeout (`AI_TIMEOUT_MS`, default 8000 per call), an error or an invalid/empty draft gives an operator-only notice and never forwards the instruction literally. The consultation remains open; use `/enviar <texto>` to send without AI. Consultations already replied to or with an uncertain customer send refuse all further sends.
 
 ### Testing
 
