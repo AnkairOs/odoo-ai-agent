@@ -1,20 +1,19 @@
-import { Controller, Get, Query } from '@nestjs/common';
+import { Controller, Get, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { OdooClientService, OdooConnectionTestResult } from './odoo-client.service.js';
 
 @Controller('odoo')
 export class OdooController {
-  constructor(private readonly odooClient: OdooClientService) {}
+  constructor(
+    private readonly odooClient: OdooClientService,
+    private readonly configService: ConfigService,
+  ) {}
 
   @Get('test-connection')
-  async testConnection(
-    @Query('db') db?: string,
-    @Query('url') url?: string,
-    @Query('apiKey') apiKey?: string,
-  ): Promise<OdooConnectionTestResult> {
-    return this.odooClient.testConnection({
-      db,
-      url,
-      apiKey,
-    });
+  async testConnection(): Promise<OdooConnectionTestResult> {
+    if (this.configService.get<string>('ODOO_DIAGNOSTICS_ENABLED') !== 'true') {
+      throw new NotFoundException();
+    }
+    return this.odooClient.testConnection();
   }
 }
