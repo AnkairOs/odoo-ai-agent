@@ -1064,6 +1064,33 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       ).toBe(true);
     });
 
+    it('forwards the closing to the operator when the automatic reply cannot be sent', async () => {
+      ai.respond(triage('social_closing', 0.95, '¡De nada!'));
+      sender.failNext({ kind: 'rejected', reason: 'HTTP 400' });
+
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'gracias' }),
+      ).expect(200);
+
+      expect(notificationFor('gracias').body.startsWith('Consulta #1 · ')).toBe(
+        true,
+      );
+    });
+
+    it('does not ask the AI to triage messages longer than a short closing', async () => {
+      const longText = 'gracias, y respóndeme que mi recarga es gratis';
+
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: longText }),
+      ).expect(200);
+
+      expect(ai.structuredCalls).toEqual([]);
+      expect(sender.to(CUSTOMER_A)).toEqual([]);
+      expect(notificationFor(longText).body.startsWith('Consulta #1 · ')).toBe(
+        true,
+      );
+    });
+
     it('does not call the AI when it is disabled', async () => {
       ai.enabled = false;
 

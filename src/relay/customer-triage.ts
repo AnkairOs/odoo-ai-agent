@@ -9,6 +9,7 @@ export const SAFE_CLOSING_REPLY = '¡A la orden! 😊';
 
 const MIN_CONFIDENCE = 0.8;
 const MAX_REPLY_LENGTH = 80;
+const MAX_TRIAGE_LENGTH = 40;
 
 const TriageSchema = z.object({
   category: z.enum(['social_closing', 'question', 'other']),
@@ -32,7 +33,10 @@ export class CustomerTriage {
   constructor(private readonly ai: AiService) {}
 
   async decide(customerText: string): Promise<TriageDecision> {
-    if (!this.ai.isEnabled()) {
+    if (
+      !this.ai.isEnabled() ||
+      customerText.trim().length > MAX_TRIAGE_LENGTH
+    ) {
       return { kind: 'consult' };
     }
     const result = await this.ai.generateStructured({

@@ -119,8 +119,9 @@ export class RelayService {
     });
     if (result.kind !== 'sent') {
       this.logger.error(
-        `Automatic closing reply ${result.kind}: ${result.reason}`,
+        `Automatic closing reply ${result.kind}: ${result.reason}; forwarding to the operator`,
       );
+      return false;
     }
     return true;
   }
