@@ -9,7 +9,12 @@ import { ConfigModule } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { AiService } from '../ai/ai.service.js';
-import type { StructuredRequest, StructuredResult } from '../ai/ai.types.js';
+import type {
+  StructuredRequest,
+  StructuredResult,
+  ToolLoopRequest,
+  ToolLoopResult,
+} from '../ai/ai.types.js';
 import { RelayJobProcessor } from './relay-job.processor.js';
 import { RelayModule } from './relay.module.js';
 import { RelayStore } from './relay.store.js';
@@ -50,6 +55,45 @@ class FakeAi {
     };
     return next as StructuredResult<T>;
   }
+
+  readonly toolCalls: ToolLoopRequest[] = [];
+  private toolResults: ToolLoopResult[] = [];
+
+  suggest(result: ToolLoopResult) {
+    this.toolResults.push(result);
+  }
+
+  async generateWithTools(request: ToolLoopRequest): Promise<ToolLoopResult> {
+    this.toolCalls.push(request);
+    return (
+      this.toolResults.shift() ?? {
+        ok: false,
+        reason: 'provider_error',
+        detail: 'no fake suggestion queued',
+      }
+    );
+  }
+}
+
+function suggestion(text: string): ToolLoopResult {
+  return {
+    ok: true,
+    text,
+    toolsExecuted: [],
+    usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+  };
+}
+
+async function runTool(
+  request: ToolLoopRequest | undefined,
+  name: string,
+  input: unknown,
+): Promise<unknown> {
+  const execute = request?.tools[name]?.execute;
+  if (!execute) {
+    throw new Error(`no executable tool ${name}`);
+  }
+  return execute(input, { toolCallId: 'call-1', messages: [], context: {} });
 }
 
 function triage(category: string, confidence: number, reply = '') {
@@ -1031,6 +1075,292 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       expect(notificationFor('gracias').body.startsWith('Consulta #1 · ')).toBe(
         true,
       );
+    });
+  });
+  describe('F2 reply suggestions', () => {
+    const SUGGESTED = 'Sí, tenemos recargas de $10 😊';
+
+    beforeEach(() => {
+      ai.enabled = true;
+    });
+
+    async function askWithSuggestion(
+      id: string,
+      body: string,
+      text: string | undefined,
+      { from = CUSTOMER_A, continuation = false } = {},
+    ) {
+      if (!continuation) {
+        ai.respond(triage('question', 0.99));
+      }
+      if (text !== undefined) {
+        ai.suggest(suggestion(text));
+      }
+      await deliver(inbound({ id, from, name: 'Ana', body })).expect(200);
+    }
+
+    async function operatorSays(id: string, body: string, quoted: string) {
+      await deliver(
+        inbound({ id, from: OPERATOR, body, contextId: quoted }),
+      ).expect(200);
+    }
+
+    it('shows the AI suggestion in the operator notification', async () => {
+      await askWithSuggestion('wamid.A1', '¿Hay recargas de $10?', SUGGESTED);
+
+      expect(sender.to(OPERATOR).map((m) => m.body)).toEqual([
+        `Consulta #1 · Ana (…1111)\n\n¿Hay recargas de $10?\n\n💡 Sugerencia: ${SUGGESTED}\n\nResponde "ok" citando este mensaje para enviar la sugerencia, o escribe tu propia respuesta.`,
+      ]);
+      expect(JSON.stringify(ai.toolCalls[0]?.messages)).toContain(
+        '¿Hay recargas de $10?',
+      );
+      expect(Object.keys(ai.toolCalls[0]?.tools ?? {}).sort()).toEqual([
+        'get_customer_history',
+        'search_past_answers',
+      ]);
+    });
+
+    it('trims the suggestion before showing it', async () => {
+      await askWithSuggestion('wamid.A1', '¿Hay?', `  ${SUGGESTED}\n `);
+
+      expect(notificationFor('¿Hay?').body).toContain(
+        `💡 Sugerencia: ${SUGGESTED}\n\nResponde "ok"`,
+      );
+    });
+
+    it.each(['ok', 'OK', ' Ok '])(
+      'sends the suggestion verbatim when the operator answers "%s"',
+      async (accept) => {
+        await askWithSuggestion('wamid.A1', '¿Hay recargas?', SUGGESTED);
+
+        await operatorSays(
+          'wamid.OP1',
+          accept,
+          notificationId(notificationFor('¿Hay recargas?')),
+        );
+
+        expect(sender.to(CUSTOMER_A)).toEqual([
+          { to: CUSTOMER_A, body: SUGGESTED, contextMessageId: 'wamid.A1' },
+        ]);
+      },
+    );
+
+    it('relays any other operator text literally', async () => {
+      await askWithSuggestion('wamid.A1', '¿Hay recargas?', SUGGESTED);
+
+      await operatorSays(
+        'wamid.OP1',
+        'ok, pero mañana',
+        notificationId(notificationFor('¿Hay recargas?')),
+      );
+
+      expect(sender.to(CUSTOMER_A)).toEqual([
+        {
+          to: CUSTOMER_A,
+          body: 'ok, pero mañana',
+          contextMessageId: 'wamid.A1',
+        },
+      ]);
+    });
+
+    it.each([
+      ['an AI failure', undefined],
+      ['an empty suggestion', '   '],
+      ['a suggestion over 600 characters', 'a'.repeat(601)],
+    ])(
+      'keeps the plain notification and relays "ok" literally after %s',
+      async (_label, text) => {
+        await askWithSuggestion('wamid.A1', '¿Hay recargas?', text);
+
+        await operatorSays(
+          'wamid.OP1',
+          'ok',
+          notificationId(notificationFor('¿Hay recargas?')),
+        );
+
+        expect(notificationFor('¿Hay recargas?').body).toBe(
+          'Consulta #1 · Ana (…1111)\n\n¿Hay recargas?\n\nResponde citando este mensaje para contestarle.',
+        );
+        expect(sender.to(CUSTOMER_A)).toEqual([
+          { to: CUSTOMER_A, body: 'ok', contextMessageId: 'wamid.A1' },
+        ]);
+      },
+    );
+
+    it('accepts a suggestion of exactly 600 characters', async () => {
+      const longest = 'a'.repeat(600);
+      await askWithSuggestion('wamid.A1', '¿Hay?', longest);
+
+      expect(notificationFor('¿Hay?').body).toContain(
+        `💡 Sugerencia: ${longest}\n`,
+      );
+    });
+
+    it('does not ask for a suggestion when the AI is disabled', async () => {
+      ai.enabled = false;
+
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: '¿Hay?' }),
+      ).expect(200);
+
+      expect(ai.toolCalls).toEqual([]);
+    });
+
+    it('gives a continuation its own suggestion and "ok" on it sends that one', async () => {
+      await askWithSuggestion('wamid.A1', 'Hola', 'Hola, ¿en qué te ayudo?');
+      await askWithSuggestion(
+        'wamid.A2',
+        'una recarga de $10',
+        'Claro, ya te la hago',
+        { continuation: true },
+      );
+
+      await operatorSays(
+        'wamid.OP1',
+        'ok',
+        notificationId(notificationFor('una recarga de $10')),
+      );
+
+      expect(notificationFor('una recarga de $10').body).toContain(
+        '💡 Sugerencia: Claro, ya te la hago',
+      );
+      expect(JSON.stringify(ai.toolCalls[1]?.messages)).toContain(
+        'Hola\\nuna recarga de $10',
+      );
+      expect(sender.to(CUSTOMER_A)).toEqual([
+        {
+          to: CUSTOMER_A,
+          body: 'Claro, ya te la hago',
+          contextMessageId: 'wamid.A2',
+        },
+      ]);
+    });
+
+    it('refuses a second "ok" after the consultation was answered', async () => {
+      await askWithSuggestion('wamid.A1', '¿Hay recargas?', SUGGESTED);
+      const quoted = notificationId(notificationFor('¿Hay recargas?'));
+
+      await operatorSays('wamid.OP1', 'ok', quoted);
+      await operatorSays('wamid.OP2', 'ok', quoted);
+
+      expect(sender.to(CUSTOMER_A).map((m) => m.body)).toEqual([SUGGESTED]);
+      expect(sender.to(OPERATOR).at(-1)?.body).toBe(
+        'La consulta #1 ya fue respondida. No se envió nada.',
+      );
+    });
+
+    describe('read-only tools', () => {
+      async function answered(
+        id: string,
+        from: string,
+        question: string,
+        reply: string,
+      ) {
+        await askWithSuggestion(id, question, undefined, { from });
+        await operatorSays(
+          `${id}.OP`,
+          reply,
+          notificationId(notificationFor(question)),
+        );
+      }
+
+      beforeEach(async () => {
+        await answered(
+          'wamid.A1',
+          CUSTOMER_A,
+          '¿Hay recargas de $10?',
+          'Sí hay recargas',
+        );
+        await answered(
+          'wamid.B1',
+          CUSTOMER_B,
+          '¿Venden recargas de $20?',
+          'No, solo de $10',
+        );
+        await answered('wamid.B2', CUSTOMER_B, '¿Abren el domingo?', 'No');
+        await askWithSuggestion('wamid.A2', '¿Y de $5?', undefined);
+      });
+
+      it('get_customer_history returns only this customer past consultations', async () => {
+        const history = await runTool(
+          ai.toolCalls.at(-1),
+          'get_customer_history',
+          {},
+        );
+
+        expect(history).toEqual([
+          {
+            question: '¿Hay recargas de $10?',
+            reply: 'Sí hay recargas',
+            date: expect.any(String),
+          },
+        ]);
+      });
+
+      it('search_past_answers returns matching replies without phone numbers or names', async () => {
+        const found = await runTool(
+          ai.toolCalls.at(-1),
+          'search_past_answers',
+          {
+            query: 'RECARGAS',
+          },
+        );
+
+        expect(found).toEqual([
+          { question: '¿Venden recargas de $20?', reply: 'No, solo de $10' },
+          { question: '¿Hay recargas de $10?', reply: 'Sí hay recargas' },
+        ]);
+        const serialized = JSON.stringify(found);
+        for (const secret of [CUSTOMER_A, CUSTOMER_B, '1111', '2222', 'Ana']) {
+          expect(serialized).not.toContain(secret);
+        }
+      });
+
+      it('search_past_answers returns nothing for an unmatched query', async () => {
+        expect(
+          await runTool(ai.toolCalls.at(-1), 'search_past_answers', {
+            query: 'zapatos',
+          }),
+        ).toEqual([]);
+      });
+    });
+
+    it('works on a database created before replies and suggestions were stored', async () => {
+      await app.close();
+      rmSync(dbPath, { force: true });
+      const legacy = new DatabaseSync(dbPath);
+      legacy.exec(`
+        CREATE TABLE consultations (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, customer_wa_id TEXT NOT NULL, customer_name TEXT,
+          customer_message_id TEXT NOT NULL, question TEXT NOT NULL, status TEXT NOT NULL,
+          notification_message_id TEXT UNIQUE, reply_message_id TEXT, last_error TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_customer_message_id TEXT);
+        CREATE TABLE consultation_notifications (
+          message_id TEXT PRIMARY KEY,
+          consultation_id INTEGER NOT NULL REFERENCES consultations (id));
+        INSERT INTO consultations VALUES (1, '${CUSTOMER_A}', 'Ana', 'wamid.A1', 'recargas viejas', 'awaiting_reply',
+          NULL, NULL, NULL, '2026-10-16T00:00:00Z', '2026-10-16T00:00:00Z', 'wamid.A1');
+        INSERT INTO consultation_notifications VALUES ('wamid.LEGACY', 1);
+      `);
+      legacy.close();
+      await start();
+
+      await operatorSays('wamid.OP1', 'ok', 'wamid.LEGACY');
+      await askWithSuggestion('wamid.B1', '¿recargas?', SUGGESTED, {
+        from: CUSTOMER_B,
+      });
+
+      expect(sender.to(CUSTOMER_A)).toEqual([
+        { to: CUSTOMER_A, body: 'ok', contextMessageId: 'wamid.A1' },
+      ]);
+      expect(notificationFor('¿recargas?').body).toContain(
+        `💡 Sugerencia: ${SUGGESTED}`,
+      );
+      expect(
+        await runTool(ai.toolCalls.at(-1), 'search_past_answers', {
+          query: 'recargas',
+        }),
+      ).toEqual([{ question: 'recargas viejas', reply: 'ok' }]);
     });
   });
 });

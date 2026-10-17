@@ -25,6 +25,21 @@ export interface Consultation {
   status: ConsultationStatus;
 }
 
+export interface NotifiedConsultation extends Consultation {
+  suggestion?: string;
+}
+
+export interface PastConsultation {
+  question: string;
+  reply: string | null;
+  date: string;
+}
+
+export interface PastAnswer {
+  question: string;
+  reply: string;
+}
+
 export interface RelayJob {
   id: number;
   tenantId: string;
@@ -82,6 +97,7 @@ const OPEN_STATUSES =
 const UNNOTIFIED_STATUSES = "('notifying', 'notify_failed', 'notify_unknown')";
 
 const MAX_JOB_ATTEMPTS = 3;
+const PAST_RESULTS_LIMIT = 5;
 
 @Injectable()
 export class RelayStore implements OnModuleInit, OnApplicationShutdown {
@@ -98,19 +114,31 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
     this.addLastCustomerMessageColumn();
+    this.addColumnIfMissing('consultations', 'reply_text');
+    this.addColumnIfMissing('consultation_notifications', 'suggestion');
   }
 
   private addLastCustomerMessageColumn() {
-    const columns = this.db
-      .prepare('PRAGMA table_info(consultations)')
-      .all() as { name: string }[];
-    if (columns.some((c) => c.name === 'last_customer_message_id')) {
+    if (this.hasColumn('consultations', 'last_customer_message_id')) {
       return;
     }
     this.db.exec(`
       ALTER TABLE consultations ADD COLUMN last_customer_message_id TEXT;
       UPDATE consultations SET last_customer_message_id = customer_message_id;
     `);
+  }
+
+  private addColumnIfMissing(table: string, column: string) {
+    if (!this.hasColumn(table, column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+    }
+  }
+
+  private hasColumn(table: string, column: string): boolean {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as {
+      name: string;
+    }[];
+    return columns.some((c) => c.name === column);
   }
 
   onApplicationShutdown() {
@@ -173,15 +201,69 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
       .run(text, lastCustomerMessageId, now(), id);
   }
 
-  findByNotification(notificationMessageId: string): Consultation | undefined {
+  getQuestion(id: number): string | undefined {
+    const row = this.db
+      .prepare('SELECT question FROM consultations WHERE id = ?')
+      .get(id) as { question: string } | undefined;
+    return row?.question;
+  }
+
+  findByNotification(
+    notificationMessageId: string,
+  ): NotifiedConsultation | undefined {
     const row = this.db
       .prepare(
-        `SELECT c.id, c.customer_wa_id, c.last_customer_message_id, c.status
+        `SELECT c.id, c.customer_wa_id, c.last_customer_message_id, c.status, n.suggestion
          FROM consultation_notifications n JOIN consultations c ON c.id = n.consultation_id
          WHERE n.message_id = ?`,
       )
-      .get(notificationMessageId) as ConsultationRow | undefined;
-    return row && toConsultation(row);
+      .get(notificationMessageId) as
+      (ConsultationRow & { suggestion: string | null }) | undefined;
+    return (
+      row && {
+        ...toConsultation(row),
+        ...(row.suggestion === null ? {} : { suggestion: row.suggestion }),
+      }
+    );
+  }
+
+  customerHistory(
+    customerWaId: string,
+    excludedId: number,
+  ): PastConsultation[] {
+    return this.db
+      .prepare(
+        `SELECT question, reply_text AS reply, created_at AS date FROM consultations
+         WHERE customer_wa_id = ? AND id != ?
+         ORDER BY id DESC LIMIT ?`,
+      )
+      .all(
+        customerWaId,
+        excludedId,
+        PAST_RESULTS_LIMIT,
+      ) as unknown as PastConsultation[];
+  }
+
+  searchPastAnswers(keywords: string[]): PastAnswer[] {
+    if (keywords.length === 0) {
+      return [];
+    }
+    const matches = keywords
+      .map(
+        () =>
+          '(instr(lower(question), ?) > 0 OR instr(lower(reply_text), ?) > 0)',
+      )
+      .join(' OR ');
+    return this.db
+      .prepare(
+        `SELECT question, reply_text AS reply FROM consultations
+         WHERE status = 'replied' AND reply_text IS NOT NULL AND (${matches})
+         ORDER BY id DESC LIMIT ?`,
+      )
+      .all(
+        ...keywords.flatMap((keyword) => [keyword, keyword]),
+        PAST_RESULTS_LIMIT,
+      ) as unknown as PastAnswer[];
   }
 
   getStatus(id: number): ConsultationStatus | undefined {
@@ -191,12 +273,16 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
     return row?.status;
   }
 
-  recordNotificationSent(id: number, notificationMessageId: string) {
+  recordNotificationSent(
+    id: number,
+    notificationMessageId: string,
+    suggestion?: string,
+  ) {
     this.db
       .prepare(
-        'INSERT OR IGNORE INTO consultation_notifications (message_id, consultation_id) VALUES (?, ?)',
+        'INSERT OR IGNORE INTO consultation_notifications (message_id, consultation_id, suggestion) VALUES (?, ?, ?)',
       )
-      .run(notificationMessageId, id);
+      .run(notificationMessageId, id, suggestion ?? null);
     this.db
       .prepare(
         `UPDATE consultations SET status = 'awaiting_reply', last_error = NULL, updated_at = ?
@@ -238,6 +324,14 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
         'UPDATE consultations SET status = ?, reply_message_id = ?, last_error = ?, updated_at = ? WHERE id = ?',
       )
       .run(status, replyMessageId ?? null, error ?? null, now(), id);
+  }
+
+  recordReplySent(id: number, replyMessageId: string, replyText: string) {
+    this.db
+      .prepare(
+        "UPDATE consultations SET status = 'replied', reply_message_id = ?, reply_text = ?, last_error = NULL, updated_at = ? WHERE id = ?",
+      )
+      .run(replyMessageId, replyText, now(), id);
   }
 
   enqueueJob(tenantId: string, messages: InboundMessage[]): number {

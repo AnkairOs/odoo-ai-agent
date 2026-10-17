@@ -4,6 +4,7 @@ import { CustomerTriage } from './customer-triage.js';
 import { InboundMessage } from './kapso-payload.js';
 import { RelayMessages } from './relay.messages.js';
 import { Consultation, RelayStore } from './relay.store.js';
+import { ReplySuggester } from './reply-suggester.js';
 import { WHATSAPP_SENDER } from './whatsapp-sender.js';
 import type { WhatsAppSender } from './whatsapp-sender.js';
 
@@ -16,6 +17,7 @@ export class RelayService {
     private readonly store: RelayStore,
     @Inject(WHATSAPP_SENDER) private readonly sender: WhatsAppSender,
     private readonly triage: CustomerTriage,
+    private readonly suggester: ReplySuggester,
   ) {}
 
   async handle(messages: InboundMessage[]): Promise<void> {
@@ -76,6 +78,7 @@ export class RelayService {
     if (open) {
       this.store.appendQuestion(id, question, last.id);
     }
+    const suggestion = await this.suggester.suggest(id, first.from);
     const result = await this.sender.sendText({
       to: operatorWaId,
       body: RelayMessages.notification(
@@ -84,11 +87,12 @@ export class RelayService {
         first.from,
         question,
         open !== undefined,
+        suggestion,
       ),
     });
 
     if (result.kind === 'sent') {
-      this.store.recordNotificationSent(id, result.messageId);
+      this.store.recordNotificationSent(id, result.messageId, suggestion);
       return;
     }
     this.logger.error(
@@ -143,7 +147,11 @@ export class RelayService {
         this.unavailableNotice(consultation),
       );
     }
-    await this.sendReply(consultation, message.text, operatorWaId);
+    const text =
+      consultation.suggestion !== undefined && isAcceptance(message.text)
+        ? consultation.suggestion
+        : message.text;
+    await this.sendReply(consultation, text, operatorWaId);
   }
 
   private async sendReply(
@@ -158,7 +166,7 @@ export class RelayService {
     });
 
     if (result.kind === 'sent') {
-      this.store.recordReply(consultation.id, 'replied', result.messageId);
+      this.store.recordReplySent(consultation.id, result.messageId, text);
     } else if (result.kind === 'rejected') {
       this.store.recordReply(
         consultation.id,
@@ -200,6 +208,10 @@ export class RelayService {
       this.logger.error(`Operator notice ${result.kind}: ${result.reason}`);
     }
   }
+}
+
+function isAcceptance(text: string): boolean {
+  return text.trim().toLowerCase() === 'ok';
 }
 
 type RelayUnit =

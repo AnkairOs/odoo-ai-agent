@@ -5,8 +5,13 @@ export const RelayMessages = {
     waId: string,
     question: string,
     continuation: boolean,
-  ) =>
-    `Consulta #${id}${continuation ? ' (continúa)' : ''} · ${contactName} (…${waId.slice(-4)})\n\n${question}\n\nResponde citando este mensaje para contestarle.`,
+    suggestion?: string,
+  ) => {
+    const header = `Consulta #${id}${continuation ? ' (continúa)' : ''} · ${contactName} (…${waId.slice(-4)})\n\n${question}`;
+    return suggestion === undefined
+      ? `${header}\n\nResponde citando este mensaje para contestarle.`
+      : `${header}\n\n💡 Sugerencia: ${suggestion}\n\nResponde "ok" citando este mensaje para enviar la sugerencia, o escribe tu propia respuesta.`;
+  },
   nonTextPlaceholder: (type: string) =>
     `[El cliente envió un mensaje de tipo ${type} sin texto]`,
   consultationNotFound:
