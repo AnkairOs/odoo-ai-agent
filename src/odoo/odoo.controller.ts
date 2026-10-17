@@ -1,6 +1,9 @@
 import { Controller, Get, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { OdooClientService, OdooConnectionTestResult } from './odoo-client.service.js';
+import {
+  OdooClientService,
+  OdooConnectionTestResult,
+} from './odoo-client.service.js';
 
 @Controller('odoo')
 export class OdooController {

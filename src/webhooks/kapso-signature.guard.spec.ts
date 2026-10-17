@@ -1,13 +1,21 @@
 import { createHmac } from 'node:crypto';
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { Controller, HttpCode, INestApplication, Post, UseGuards } from '@nestjs/common';
+import {
+  Controller,
+  HttpCode,
+  INestApplication,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import { KapsoSignatureGuard } from './kapso-signature.guard.js';
 
 const SECRET = 'test-webhook-secret';
-const BODY = JSON.stringify({ message: { id: 'wamid.TEST', text: { body: 'Hola' } } });
+const BODY = JSON.stringify({
+  message: { id: 'wamid.TEST', text: { body: 'Hola' } },
+});
 
 const handled = vi.fn();
 
@@ -81,13 +89,16 @@ describe('KapsoSignatureGuard', () => {
     ['prefixed with sha256=', `sha256=${sign(BODY)}`],
     ['uppercase hex', sign(BODY).toUpperCase()],
     ['truncated', sign(BODY).slice(0, 32)],
-  ])('rejects a %s signature with 401 and no effect', async (_label, signature) => {
-    await createApp({ KAPSO_WEBHOOK_SECRET: SECRET });
+  ])(
+    'rejects a %s signature with 401 and no effect',
+    async (_label, signature) => {
+      await createApp({ KAPSO_WEBHOOK_SECRET: SECRET });
 
-    await post(signature).expect(401);
+      await post(signature).expect(401);
 
-    expect(handled).not.toHaveBeenCalled();
-  });
+      expect(handled).not.toHaveBeenCalled();
+    },
+  );
 
   it('fails closed when no secret is configured', async () => {
     await createApp({});

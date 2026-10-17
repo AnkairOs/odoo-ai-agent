@@ -35,6 +35,8 @@ export class KapsoSignatureGuard implements CanActivate {
       'utf8',
     );
     const received = Buffer.from(signature, 'utf8');
-    return expected.length === received.length && timingSafeEqual(expected, received);
+    return (
+      expected.length === received.length && timingSafeEqual(expected, received)
+    );
   }
 }

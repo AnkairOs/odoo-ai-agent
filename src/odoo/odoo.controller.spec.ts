@@ -48,7 +48,9 @@ describe('OdooController diagnostic', () => {
   });
 
   it('uses only server configuration and ignores client-supplied url, db and apiKey', async () => {
-    const testConnection = await createApp({ ODOO_DIAGNOSTICS_ENABLED: 'true' });
+    const testConnection = await createApp({
+      ODOO_DIAGNOSTICS_ENABLED: 'true',
+    });
 
     const response = await request(app.getHttpServer())
       .get('/odoo/test-connection')
