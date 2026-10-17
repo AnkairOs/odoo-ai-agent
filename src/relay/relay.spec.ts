@@ -604,12 +604,40 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
         {
           to: CUSTOMER_A,
           body: 'Claro, ¿de cuánto?',
-          contextMessageId: 'wamid.A1',
+          contextMessageId: 'wamid.A2',
         },
       ]);
       expect(sender.to(OPERATOR).at(-1)?.body).toBe(
         'La consulta #1 ya fue respondida. No se envió nada.',
       );
+    });
+
+    it('quotes the last message of a buffered burst when replying', async () => {
+      await deliver({
+        type: 'whatsapp.message.received',
+        batch: true,
+        data: [
+          inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'Hola' }),
+          inbound({
+            id: 'wamid.A2',
+            from: CUSTOMER_A,
+            body: 'una recarga de $5',
+          }),
+        ],
+      }).expect(200);
+
+      await deliver(
+        inbound({
+          id: 'wamid.OP1',
+          from: OPERATOR,
+          body: 'Listo',
+          contextId: notificationId(notificationFor('Hola')),
+        }),
+      ).expect(200);
+
+      expect(sender.to(CUSTOMER_A)).toEqual([
+        { to: CUSTOMER_A, body: 'Listo', contextMessageId: 'wamid.A2' },
+      ]);
     });
 
     it('opens a new consultation when the customer writes after the reply', async () => {
@@ -691,7 +719,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
         ),
       ).toBe(true);
       expect(sender.to(CUSTOMER_A)).toEqual([
-        { to: CUSTOMER_A, body: 'Listo', contextMessageId: 'wamid.A1' },
+        { to: CUSTOMER_A, body: 'Listo', contextMessageId: 'wamid.A2' },
       ]);
     });
   });

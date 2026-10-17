@@ -54,6 +54,7 @@ export class RelayService {
     operatorWaId: string,
   ): Promise<void> {
     const [first] = messages;
+    const last = messages[messages.length - 1];
     const question = messages
       .map((m) => m.text ?? RelayMessages.nonTextPlaceholder(m.type))
       .join('\n');
@@ -64,10 +65,11 @@ export class RelayService {
         customerWaId: first.from,
         customerName: first.contactName,
         customerMessageId: first.id,
+        lastCustomerMessageId: last.id,
         question,
       });
     if (open) {
-      this.store.appendQuestion(id, question);
+      this.store.appendQuestion(id, question, last.id);
     }
     const result = await this.sender.sendText({
       to: operatorWaId,
@@ -127,7 +129,7 @@ export class RelayService {
     const result = await this.sender.sendText({
       to: consultation.customerWaId,
       body: text,
-      contextMessageId: consultation.customerMessageId,
+      contextMessageId: consultation.lastCustomerMessageId,
     });
 
     if (result.kind === 'sent') {

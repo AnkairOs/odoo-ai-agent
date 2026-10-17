@@ -16,14 +16,14 @@ export type ConsultationStatus =
 export interface Consultation {
   id: number;
   customerWaId: string;
-  customerMessageId: string;
+  lastCustomerMessageId: string;
   status: ConsultationStatus;
 }
 
 interface ConsultationRow {
   id: number;
   customer_wa_id: string;
-  customer_message_id: string;
+  last_customer_message_id: string;
   status: ConsultationStatus;
 }
 
@@ -73,6 +73,20 @@ export class RelayStore implements OnModuleInit, OnModuleDestroy {
     }
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
+    this.addLastCustomerMessageColumn();
+  }
+
+  private addLastCustomerMessageColumn() {
+    const columns = this.db
+      .prepare('PRAGMA table_info(consultations)')
+      .all() as { name: string }[];
+    if (columns.some((c) => c.name === 'last_customer_message_id')) {
+      return;
+    }
+    this.db.exec(`
+      ALTER TABLE consultations ADD COLUMN last_customer_message_id TEXT;
+      UPDATE consultations SET last_customer_message_id = customer_message_id;
+    `);
   }
 
   onModuleDestroy() {
@@ -92,19 +106,21 @@ export class RelayStore implements OnModuleInit, OnModuleDestroy {
     customerWaId: string;
     customerName?: string;
     customerMessageId: string;
+    lastCustomerMessageId: string;
     question: string;
   }): number {
     const timestamp = now();
     const result = this.db
       .prepare(
         `INSERT INTO consultations
-           (customer_wa_id, customer_name, customer_message_id, question, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'notifying', ?, ?)`,
+           (customer_wa_id, customer_name, customer_message_id, last_customer_message_id, question, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'notifying', ?, ?)`,
       )
       .run(
         input.customerWaId,
         input.customerName ?? null,
         input.customerMessageId,
+        input.lastCustomerMessageId,
         input.question,
         timestamp,
         timestamp,
@@ -115,7 +131,7 @@ export class RelayStore implements OnModuleInit, OnModuleDestroy {
   findOpenForCustomer(customerWaId: string): Consultation | undefined {
     const row = this.db
       .prepare(
-        `SELECT id, customer_wa_id, customer_message_id, status FROM consultations
+        `SELECT id, customer_wa_id, last_customer_message_id, status FROM consultations
          WHERE customer_wa_id = ? AND status IN ${OPEN_STATUSES}
          ORDER BY id DESC LIMIT 1`,
       )
@@ -123,18 +139,20 @@ export class RelayStore implements OnModuleInit, OnModuleDestroy {
     return row && toConsultation(row);
   }
 
-  appendQuestion(id: number, text: string) {
+  appendQuestion(id: number, text: string, lastCustomerMessageId: string) {
     this.db
       .prepare(
-        'UPDATE consultations SET question = question || char(10) || ?, updated_at = ? WHERE id = ?',
+        `UPDATE consultations
+         SET question = question || char(10) || ?, last_customer_message_id = ?, updated_at = ?
+         WHERE id = ?`,
       )
-      .run(text, now(), id);
+      .run(text, lastCustomerMessageId, now(), id);
   }
 
   findByNotification(notificationMessageId: string): Consultation | undefined {
     const row = this.db
       .prepare(
-        `SELECT c.id, c.customer_wa_id, c.customer_message_id, c.status
+        `SELECT c.id, c.customer_wa_id, c.last_customer_message_id, c.status
          FROM consultation_notifications n JOIN consultations c ON c.id = n.consultation_id
          WHERE n.message_id = ?`,
       )
@@ -203,7 +221,7 @@ function toConsultation(row: ConsultationRow): Consultation {
   return {
     id: row.id,
     customerWaId: row.customer_wa_id,
-    customerMessageId: row.customer_message_id,
+    lastCustomerMessageId: row.last_customer_message_id,
     status: row.status,
   };
 }
