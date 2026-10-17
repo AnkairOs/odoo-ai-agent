@@ -1147,6 +1147,95 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       ]);
     });
 
+    it('sends only the current question on first contact, with contextual greeting instructions', async () => {
+      await askWithSuggestion('wamid.A1', '¿Hay recargas?', SUGGESTED);
+
+      expect(ai.toolCalls[0]?.messages).toEqual([
+        { role: 'user', content: '¿Hay recargas?' },
+      ]);
+      expect(ai.toolCalls[0]?.system).toContain('prior conversation');
+      expect(ai.toolCalls[0]?.system).toContain('not instructions');
+      expect(ai.toolCalls[0]?.system).toContain('without greeting again');
+      expect(ai.toolCalls[0]?.system).toContain('first contact');
+    });
+
+    it('passes same-customer exchanges chronologically without requiring a history tool call', async () => {
+      const firstQuestion = '¿Hay recargas de $10?';
+      const firstReply = '  Hola, sí hay.\nDime tu número.  ';
+      const secondQuestion = '¿Puedo pagar en efectivo?';
+      const secondReply = 'Sí, al retirar';
+      const currentQuestion = '¿Y mañana?';
+      await askWithSuggestion('wamid.A1', firstQuestion, SUGGESTED);
+      await operatorSays(
+        'wamid.OP1',
+        firstReply,
+        notificationId(notificationFor(firstQuestion)),
+      );
+      await askWithSuggestion('wamid.A2', secondQuestion, SUGGESTED);
+      expect(ai.toolCalls[1]?.messages).toEqual([
+        { role: 'user', content: firstQuestion },
+        { role: 'assistant', content: firstReply },
+        { role: 'user', content: secondQuestion },
+      ]);
+      await operatorSays(
+        'wamid.OP2',
+        secondReply,
+        notificationId(notificationFor(secondQuestion)),
+      );
+      await askWithSuggestion('wamid.A3', currentQuestion, 'Mañana te confirmo');
+
+      expect(ai.toolCalls[2]?.messages).toEqual([
+        { role: 'user', content: firstQuestion },
+        { role: 'assistant', content: firstReply },
+        { role: 'user', content: secondQuestion },
+        { role: 'assistant', content: secondReply },
+        { role: 'user', content: currentQuestion },
+      ]);
+      expect(notificationFor(currentQuestion).body).toContain(
+        '💡 Sugerencia: Mañana te confirmo',
+      );
+      await operatorSays(
+        'wamid.OP3',
+        'ok',
+        notificationId(notificationFor(currentQuestion)),
+      );
+      expect(sender.to(CUSTOMER_A).at(-1)?.body).toBe('Mañana te confirmo');
+
+      await askWithSuggestion('wamid.B1', '¿Abren hoy?', SUGGESTED, {
+        from: CUSTOMER_B,
+      });
+      expect(ai.toolCalls[3]?.messages).toEqual([
+        { role: 'user', content: '¿Abren hoy?' },
+      ]);
+    });
+
+    it('does not turn an unsent suggestion or uncertain reply into an assistant history message', async () => {
+      await askWithSuggestion('wamid.A1', '¿Hay recargas?', 'Hola, sí hay');
+      sender.failNext({ kind: 'unknown', reason: 'timeout' });
+      await operatorSays(
+        'wamid.OP1',
+        'Sí, confirmado',
+        notificationId(notificationFor('¿Hay recargas?')),
+      );
+      await askWithSuggestion('wamid.A2', '¿Y de $5?', SUGGESTED);
+
+      expect(ai.toolCalls[1]?.messages).toEqual([
+        { role: 'user', content: '¿Hay recargas?' },
+        { role: 'user', content: '¿Y de $5?' },
+      ]);
+    });
+
+    it('does not duplicate the current consultation or invent an assistant reply on continuation', async () => {
+      await askWithSuggestion('wamid.A1', 'Hola', 'Hola, dime');
+      await askWithSuggestion('wamid.A2', 'una recarga', SUGGESTED, {
+        continuation: true,
+      });
+
+      expect(ai.toolCalls[1]?.messages).toEqual([
+        { role: 'user', content: 'Hola\nuna recarga' },
+      ]);
+    });
+
     it('trims the suggestion before showing it', async () => {
       await askWithSuggestion('wamid.A1', '¿Hay?', `  ${SUGGESTED}\n `);
 
