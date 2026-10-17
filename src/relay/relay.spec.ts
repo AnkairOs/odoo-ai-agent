@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -366,6 +367,36 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
     ]);
   });
 
+  it('still answers consultations notified before the notifications table existed', async () => {
+    await app.close();
+    rmSync(dbPath, { force: true });
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec(`
+      CREATE TABLE consultations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, customer_wa_id TEXT NOT NULL, customer_name TEXT,
+        customer_message_id TEXT NOT NULL, question TEXT NOT NULL, status TEXT NOT NULL,
+        notification_message_id TEXT UNIQUE, reply_message_id TEXT, last_error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      INSERT INTO consultations VALUES (1, '${CUSTOMER_A}', 'Ana', 'wamid.A1', 'Hola', 'awaiting_reply',
+        'wamid.LEGACY', NULL, NULL, '2026-10-16T00:00:00Z', '2026-10-16T00:00:00Z');
+    `);
+    legacy.close();
+    await start();
+
+    await deliver(
+      inbound({
+        id: 'wamid.OP1',
+        from: OPERATOR,
+        body: 'respuesta',
+        contextId: 'wamid.LEGACY',
+      }),
+    ).expect(200);
+
+    expect(sender.sent).toEqual([
+      { to: CUSTOMER_A, body: 'respuesta', contextMessageId: 'wamid.A1' },
+    ]);
+  });
+
   it('rejects an invalid signature with 401 and no effects', async () => {
     await deliver(
       inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'hola' }),
@@ -506,5 +537,162 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       'No sé si la respuesta a la consulta #1 llegó (timeout). Verifica en Kapso antes de volver a escribirle; no se reintentará automáticamente.',
       'La consulta #1 tiene un envío con resultado incierto. Verifica en Kapso; no se envió nada.',
     ]);
+  });
+
+  describe('multi-message customers', () => {
+    it('keeps adding messages to the open consultation until the operator replies', async () => {
+      await deliver(
+        inbound({
+          id: 'wamid.A1',
+          from: CUSTOMER_A,
+          name: 'Ana',
+          body: 'Hola',
+        }),
+      ).expect(200);
+      await deliver(
+        inbound({
+          id: 'wamid.A2',
+          from: CUSTOMER_A,
+          name: 'Ana',
+          body: 'una recarga de $5',
+        }),
+      ).expect(200);
+      await deliver(
+        inbound({
+          id: 'wamid.B1',
+          from: CUSTOMER_B,
+          name: 'Beto',
+          body: 'otra cosa',
+        }),
+      ).expect(200);
+
+      expect(sender.to(OPERATOR).map((m) => m.body)).toEqual([
+        'Consulta #1 · Ana (…1111)\n\nHola\n\nResponde citando este mensaje para contestarle.',
+        'Consulta #1 (continúa) · Ana (…1111)\n\nuna recarga de $5\n\nResponde citando este mensaje para contestarle.',
+        'Consulta #2 · Beto (…2222)\n\notra cosa\n\nResponde citando este mensaje para contestarle.',
+      ]);
+    });
+
+    it('accepts a reply quoting any notification of the consultation, once', async () => {
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'Hola' }),
+      ).expect(200);
+      await deliver(
+        inbound({ id: 'wamid.A2', from: CUSTOMER_A, body: 'una recarga' }),
+      ).expect(200);
+      const first = notificationId(notificationFor('Hola'));
+      const continuation = notificationId(notificationFor('una recarga'));
+
+      await deliver(
+        inbound({
+          id: 'wamid.OP1',
+          from: OPERATOR,
+          body: 'Claro, ¿de cuánto?',
+          contextId: continuation,
+        }),
+      ).expect(200);
+      await deliver(
+        inbound({
+          id: 'wamid.OP2',
+          from: OPERATOR,
+          body: 'otra',
+          contextId: first,
+        }),
+      ).expect(200);
+
+      expect(sender.to(CUSTOMER_A)).toEqual([
+        {
+          to: CUSTOMER_A,
+          body: 'Claro, ¿de cuánto?',
+          contextMessageId: 'wamid.A1',
+        },
+      ]);
+      expect(sender.to(OPERATOR).at(-1)?.body).toBe(
+        'La consulta #1 ya fue respondida. No se envió nada.',
+      );
+    });
+
+    it('opens a new consultation when the customer writes after the reply', async () => {
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'Hola' }),
+      ).expect(200);
+      await deliver(
+        inbound({
+          id: 'wamid.OP1',
+          from: OPERATOR,
+          body: 'Dime',
+          contextId: notificationId(notificationFor('Hola')),
+        }),
+      ).expect(200);
+
+      await deliver(
+        inbound({ id: 'wamid.A2', from: CUSTOMER_A, body: 'gracias' }),
+      ).expect(200);
+
+      expect(notificationFor('gracias').body.startsWith('Consulta #2 · ')).toBe(
+        true,
+      );
+    });
+
+    it('sends one notification for a buffered burst from the same customer', async () => {
+      const batch = {
+        type: 'whatsapp.message.received',
+        batch: true,
+        data: [
+          inbound({
+            id: 'wamid.A1',
+            from: CUSTOMER_A,
+            name: 'Ana',
+            body: 'Hola',
+          }),
+          inbound({
+            id: 'wamid.A2',
+            from: CUSTOMER_A,
+            name: 'Ana',
+            body: 'buenas',
+          }),
+          inbound({
+            id: 'wamid.A3',
+            from: CUSTOMER_A,
+            name: 'Ana',
+            body: 'una recarga de...',
+          }),
+        ],
+      };
+
+      await deliver(batch).expect(200);
+
+      expect(sender.to(OPERATOR).map((m) => m.body)).toEqual([
+        'Consulta #1 · Ana (…1111)\n\nHola\nbuenas\nuna recarga de...\n\nResponde citando este mensaje para contestarle.',
+      ]);
+    });
+
+    it('recovers a consultation whose first notification failed when the customer writes again', async () => {
+      sender.failNext({ kind: 'rejected', reason: 'HTTP 400' });
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'Hola' }),
+      ).expect(200);
+      await deliver(
+        inbound({ id: 'wamid.A2', from: CUSTOMER_A, body: 'una recarga' }),
+      ).expect(200);
+
+      await deliver(
+        inbound({
+          id: 'wamid.OP1',
+          from: OPERATOR,
+          body: 'Listo',
+          contextId: notificationId(notificationFor('una recarga')),
+        }),
+      ).expect(200);
+
+      expect(
+        notificationFor('una recarga').body.startsWith(
+          'Consulta #1 (continúa) · ',
+        ),
+      ).toBe(true);
+      expect(sender.to(CUSTOMER_A)).toEqual([
+        { to: CUSTOMER_A, body: 'Listo', contextMessageId: 'wamid.A1' },
+      ]);
+    });
   });
 });

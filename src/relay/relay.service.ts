@@ -17,12 +17,6 @@ export class RelayService {
   ) {}
 
   async handle(messages: InboundMessage[]): Promise<void> {
-    for (const message of messages) {
-      await this.handleOne(message);
-    }
-  }
-
-  private async handleOne(message: InboundMessage): Promise<void> {
     const businessPhoneId = this.configService.get<string>(
       'KAPSO_PHONE_NUMBER_ID',
     );
@@ -33,55 +27,69 @@ export class RelayService {
       );
       return;
     }
+    const fresh = messages.filter((message) =>
+      this.accept(message, businessPhoneId),
+    );
+    for (const unit of groupCustomerBursts(fresh, operatorWaId)) {
+      if (unit.kind === 'operator') {
+        await this.handleOperatorReply(unit.message, operatorWaId);
+      } else {
+        await this.handleCustomerMessages(unit.messages, operatorWaId);
+      }
+    }
+  }
+
+  private accept(message: InboundMessage, businessPhoneId: string): boolean {
     if (message.phoneNumberId !== businessPhoneId) {
       this.logger.warn(
         `Ignoring message for unexpected phone number id ${message.phoneNumberId}`,
       );
-      return;
+      return false;
     }
-    if (!this.store.markProcessed(message.id)) {
-      return;
-    }
-    if (message.from === operatorWaId) {
-      await this.handleOperatorReply(message, operatorWaId);
-    } else {
-      await this.handleCustomerMessage(message, operatorWaId);
-    }
+    return this.store.markProcessed(message.id);
   }
 
-  private async handleCustomerMessage(
-    message: InboundMessage,
+  private async handleCustomerMessages(
+    messages: InboundMessage[],
     operatorWaId: string,
   ): Promise<void> {
-    const question =
-      message.text ?? RelayMessages.nonTextPlaceholder(message.type);
-    const id = this.store.createConsultation({
-      customerWaId: message.from,
-      customerName: message.contactName,
-      customerMessageId: message.id,
-      question,
-    });
+    const [first] = messages;
+    const question = messages
+      .map((m) => m.text ?? RelayMessages.nonTextPlaceholder(m.type))
+      .join('\n');
+    const open = this.store.findOpenForCustomer(first.from);
+    const id =
+      open?.id ??
+      this.store.createConsultation({
+        customerWaId: first.from,
+        customerName: first.contactName,
+        customerMessageId: first.id,
+        question,
+      });
+    if (open) {
+      this.store.appendQuestion(id, question);
+    }
     const result = await this.sender.sendText({
       to: operatorWaId,
       body: RelayMessages.notification(
         id,
-        message.contactName ?? 'Cliente',
-        message.from,
+        first.contactName ?? 'Cliente',
+        first.from,
         question,
+        open !== undefined,
       ),
     });
 
     if (result.kind === 'sent') {
-      this.store.recordNotification(id, 'awaiting_reply', result.messageId);
+      this.store.recordNotificationSent(id, result.messageId);
       return;
     }
     this.logger.error(
       `Consultation #${id} notification ${result.kind}: ${result.reason}`,
     );
-    this.store.recordNotification(
+    this.store.recordNotificationFailed(
       id,
       result.kind === 'rejected' ? 'notify_failed' : 'notify_unknown',
-      undefined,
       result.reason,
     );
   }
@@ -165,4 +173,31 @@ export class RelayService {
       this.logger.error(`Operator notice ${result.kind}: ${result.reason}`);
     }
   }
+}
+
+type RelayUnit =
+  | { kind: 'operator'; message: InboundMessage }
+  | { kind: 'customer'; messages: InboundMessage[] };
+
+function groupCustomerBursts(
+  messages: InboundMessage[],
+  operatorWaId: string,
+): RelayUnit[] {
+  const units: RelayUnit[] = [];
+  const bursts = new Map<string, InboundMessage[]>();
+  for (const message of messages) {
+    if (message.from === operatorWaId) {
+      units.push({ kind: 'operator', message });
+      continue;
+    }
+    const burst = bursts.get(message.from);
+    if (burst) {
+      burst.push(message);
+    } else {
+      const created = [message];
+      bursts.set(message.from, created);
+      units.push({ kind: 'customer', messages: created });
+    }
+  }
+  return units;
 }

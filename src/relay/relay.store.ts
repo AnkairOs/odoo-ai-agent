@@ -47,7 +47,17 @@ const SCHEMA = `
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS consultation_notifications (
+    message_id TEXT PRIMARY KEY,
+    consultation_id INTEGER NOT NULL REFERENCES consultations (id)
+  );
+  INSERT OR IGNORE INTO consultation_notifications (message_id, consultation_id)
+    SELECT notification_message_id, id FROM consultations WHERE notification_message_id IS NOT NULL;
 `;
+
+const OPEN_STATUSES =
+  "('notifying', 'notify_failed', 'notify_unknown', 'awaiting_reply')";
+const UNNOTIFIED_STATUSES = "('notifying', 'notify_failed', 'notify_unknown')";
 
 @Injectable()
 export class RelayStore implements OnModuleInit, OnModuleDestroy {
@@ -102,10 +112,31 @@ export class RelayStore implements OnModuleInit, OnModuleDestroy {
     return Number(result.lastInsertRowid);
   }
 
+  findOpenForCustomer(customerWaId: string): Consultation | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT id, customer_wa_id, customer_message_id, status FROM consultations
+         WHERE customer_wa_id = ? AND status IN ${OPEN_STATUSES}
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(customerWaId) as ConsultationRow | undefined;
+    return row && toConsultation(row);
+  }
+
+  appendQuestion(id: number, text: string) {
+    this.db
+      .prepare(
+        'UPDATE consultations SET question = question || char(10) || ?, updated_at = ? WHERE id = ?',
+      )
+      .run(text, now(), id);
+  }
+
   findByNotification(notificationMessageId: string): Consultation | undefined {
     const row = this.db
       .prepare(
-        'SELECT id, customer_wa_id, customer_message_id, status FROM consultations WHERE notification_message_id = ?',
+        `SELECT c.id, c.customer_wa_id, c.customer_message_id, c.status
+         FROM consultation_notifications n JOIN consultations c ON c.id = n.consultation_id
+         WHERE n.message_id = ?`,
       )
       .get(notificationMessageId) as ConsultationRow | undefined;
     return row && toConsultation(row);
@@ -118,17 +149,31 @@ export class RelayStore implements OnModuleInit, OnModuleDestroy {
     return row?.status;
   }
 
-  recordNotification(
+  recordNotificationSent(id: number, notificationMessageId: string) {
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO consultation_notifications (message_id, consultation_id) VALUES (?, ?)',
+      )
+      .run(notificationMessageId, id);
+    this.db
+      .prepare(
+        `UPDATE consultations SET status = 'awaiting_reply', last_error = NULL, updated_at = ?
+         WHERE id = ? AND status IN ${UNNOTIFIED_STATUSES}`,
+      )
+      .run(now(), id);
+  }
+
+  recordNotificationFailed(
     id: number,
-    status: ConsultationStatus,
-    notificationMessageId?: string,
-    error?: string,
+    status: 'notify_failed' | 'notify_unknown',
+    error: string,
   ) {
     this.db
       .prepare(
-        'UPDATE consultations SET status = ?, notification_message_id = ?, last_error = ?, updated_at = ? WHERE id = ?',
+        `UPDATE consultations SET status = ?, last_error = ?, updated_at = ?
+         WHERE id = ? AND status IN ${UNNOTIFIED_STATUSES}`,
       )
-      .run(status, notificationMessageId ?? null, error ?? null, now(), id);
+      .run(status, error, now(), id);
   }
 
   claimForReply(id: number): boolean {

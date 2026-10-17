@@ -4,8 +4,9 @@ export const RelayMessages = {
     contactName: string,
     waId: string,
     question: string,
+    continuation: boolean,
   ) =>
-    `Consulta #${id} · ${contactName} (…${waId.slice(-4)})\n\n${question}\n\nResponde citando este mensaje para contestarle.`,
+    `Consulta #${id}${continuation ? ' (continúa)' : ''} · ${contactName} (…${waId.slice(-4)})\n\n${question}\n\nResponde citando este mensaje para contestarle.`,
   nonTextPlaceholder: (type: string) =>
     `[El cliente envió un mensaje de tipo ${type} sin texto]`,
   consultationNotFound:
