@@ -1,5 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { CustomerTriage } from './customer-triage.js';
 import { InboundMessage } from './kapso-payload.js';
 import { RelayMessages } from './relay.messages.js';
 import { Consultation, RelayStore } from './relay.store.js';
@@ -14,6 +15,7 @@ export class RelayService {
     private readonly configService: ConfigService,
     private readonly store: RelayStore,
     @Inject(WHATSAPP_SENDER) private readonly sender: WhatsAppSender,
+    private readonly triage: CustomerTriage,
   ) {}
 
   async handle(messages: InboundMessage[]): Promise<void> {
@@ -59,6 +61,9 @@ export class RelayService {
       .map((m) => m.text ?? RelayMessages.nonTextPlaceholder(m.type))
       .join('\n');
     const open = this.store.findOpenForCustomer(first.from);
+    if (!open && (await this.answeredByTriage(first.from, question))) {
+      return;
+    }
     const id =
       open?.id ??
       this.store.createConsultation({
@@ -94,6 +99,26 @@ export class RelayService {
       result.kind === 'rejected' ? 'notify_failed' : 'notify_unknown',
       result.reason,
     );
+  }
+
+  private async answeredByTriage(
+    customerWaId: string,
+    text: string,
+  ): Promise<boolean> {
+    const decision = await this.triage.decide(text);
+    if (decision.kind !== 'auto_reply') {
+      return false;
+    }
+    const result = await this.sender.sendText({
+      to: customerWaId,
+      body: decision.reply,
+    });
+    if (result.kind !== 'sent') {
+      this.logger.error(
+        `Automatic closing reply ${result.kind}: ${result.reason}`,
+      );
+    }
+    return true;
   }
 
   private async handleOperatorReply(

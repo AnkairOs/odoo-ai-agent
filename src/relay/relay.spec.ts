@@ -8,6 +8,8 @@ import { INestApplication } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
+import { AiService } from '../ai/ai.service.js';
+import type { StructuredRequest, StructuredResult } from '../ai/ai.types.js';
 import { RelayJobProcessor } from './relay-job.processor.js';
 import { RelayModule } from './relay.module.js';
 import { RelayStore } from './relay.store.js';
@@ -23,6 +25,40 @@ const BUSINESS_PHONE_ID = '100000000000001';
 const OPERATOR = '15550000001';
 const CUSTOMER_A = '15550001111';
 const CUSTOMER_B = '15550002222';
+
+class FakeAi {
+  enabled = false;
+  readonly structuredCalls: StructuredRequest<unknown>[] = [];
+  private results: unknown[] = [];
+
+  isEnabled() {
+    return this.enabled;
+  }
+
+  respond(result: unknown) {
+    this.results.push(result);
+  }
+
+  async generateStructured<T>(
+    request: StructuredRequest<T>,
+  ): Promise<StructuredResult<T>> {
+    this.structuredCalls.push(request as StructuredRequest<unknown>);
+    const next = this.results.shift() ?? {
+      ok: false,
+      reason: 'provider_error',
+      detail: 'no fake result queued',
+    };
+    return next as StructuredResult<T>;
+  }
+}
+
+function triage(category: string, confidence: number, reply = '') {
+  return {
+    ok: true,
+    object: { category, confidence, reply },
+    usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+  };
+}
 
 class FakeSender implements WhatsAppSender {
   readonly sent: OutgoingText[] = [];
@@ -112,6 +148,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
   let dbPath: string;
   let app: INestApplication;
   let sender: FakeSender;
+  let ai: FakeAi;
   let jobs: RelayJobProcessor;
 
   async function start() {
@@ -136,6 +173,8 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
     })
       .overrideProvider(WHATSAPP_SENDER)
       .useValue(sender)
+      .overrideProvider(AiService)
+      .useValue(ai)
       .compile();
     app = moduleRef.createNestApplication({ rawBody: true });
     await app.init();
@@ -206,6 +245,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'relay-'));
     dbPath = join(dir, 'relay.sqlite');
+    ai = new FakeAi();
     await start();
   });
 
@@ -894,6 +934,103 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       expect(sender.to(CUSTOMER_A)).toEqual([
         { to: CUSTOMER_A, body: 'Listo', contextMessageId: 'wamid.A2' },
       ]);
+    });
+  });
+
+  describe('F1 social triage', () => {
+    beforeEach(() => {
+      ai.enabled = true;
+    });
+
+    it('answers a social closing with the AI reply and creates no consultation', async () => {
+      ai.respond(
+        triage('social_closing', 0.95, '¡Con gusto, que tengas buen día!'),
+      );
+
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'gracias' }),
+      ).expect(200);
+
+      expect(sender.sent).toEqual([
+        { to: CUSTOMER_A, body: '¡Con gusto, que tengas buen día!' },
+      ]);
+      expect(JSON.stringify(ai.structuredCalls[0]?.messages)).toContain(
+        'gracias',
+      );
+    });
+
+    it.each([
+      ['a price', 'Tenemos recargas de $10'],
+      ['digits', 'Te esperamos el 5 de mayo'],
+      ['several lines', '¡Gracias!\nVuelve pronto'],
+      [
+        'too much text',
+        'Muchas gracias por escribirnos, fue un gusto atenderte y esperamos verte pronto otra vez',
+      ],
+      ['nothing', '   '],
+    ])(
+      'replaces an AI reply containing %s with the safe default',
+      async (_label, reply) => {
+        ai.respond(triage('social_closing', 0.95, reply));
+
+        await deliver(
+          inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'gracias' }),
+        ).expect(200);
+
+        expect(sender.sent).toEqual([
+          { to: CUSTOMER_A, body: '¡A la orden! 😊' },
+        ]);
+      },
+    );
+
+    it.each([
+      ['a low-confidence closing', triage('social_closing', 0.5, '¡De nada!')],
+      ['a question', triage('question', 0.99)],
+      ['other messages', triage('other', 0.9)],
+      ['an AI failure', { ok: false, reason: 'timeout', detail: 'slow' }],
+    ])(
+      'forwards %s to the operator as a consultation',
+      async (_label, result) => {
+        ai.respond(result);
+
+        await deliver(
+          inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'gracias' }),
+        ).expect(200);
+
+        expect(sender.to(CUSTOMER_A)).toEqual([]);
+        expect(
+          notificationFor('gracias').body.startsWith('Consulta #1 · '),
+        ).toBe(true);
+      },
+    );
+
+    it('does not triage messages of a customer with an open consultation', async () => {
+      ai.respond(triage('question', 0.99));
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: '¿hay de $10?' }),
+      ).expect(200);
+
+      await deliver(
+        inbound({ id: 'wamid.A2', from: CUSTOMER_A, body: 'gracias' }),
+      ).expect(200);
+
+      expect(ai.structuredCalls).toHaveLength(1);
+      expect(
+        notificationFor('gracias').body.startsWith('Consulta #1 (continúa) · '),
+      ).toBe(true);
+    });
+
+    it('does not call the AI when it is disabled', async () => {
+      ai.enabled = false;
+
+      await deliver(
+        inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'gracias' }),
+      ).expect(200);
+
+      expect(ai.structuredCalls).toEqual([]);
+      expect(notificationFor('gracias').body.startsWith('Consulta #1 · ')).toBe(
+        true,
+      );
     });
   });
 });
