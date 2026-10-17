@@ -4,6 +4,8 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module.js';
 
+process.env.RELAY_DB_PATH = ':memory:';
+
 describe('AppController (e2e)', () => {
   let app: INestApplication<App>;
 

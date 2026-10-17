@@ -31,3 +31,6 @@ coverage/
 # Logs
 logs
 *.log
+
+# Relay SQLite data
+data/
