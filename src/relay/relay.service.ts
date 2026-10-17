@@ -1,8 +1,10 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { CustomerTriage } from './customer-triage.js';
 import { InboundMessage } from './kapso-payload.js';
 import { RelayMessages } from './relay.messages.js';
 import { Consultation, RelayStore } from './relay.store.js';
+import { ReplySuggester } from './reply-suggester.js';
 import { WHATSAPP_SENDER } from './whatsapp-sender.js';
 import type { WhatsAppSender } from './whatsapp-sender.js';
 
@@ -14,6 +16,8 @@ export class RelayService {
     private readonly configService: ConfigService,
     private readonly store: RelayStore,
     @Inject(WHATSAPP_SENDER) private readonly sender: WhatsAppSender,
+    private readonly triage: CustomerTriage,
+    private readonly suggester: ReplySuggester,
   ) {}
 
   async handle(messages: InboundMessage[]): Promise<void> {
@@ -59,6 +63,9 @@ export class RelayService {
       .map((m) => m.text ?? RelayMessages.nonTextPlaceholder(m.type))
       .join('\n');
     const open = this.store.findOpenForCustomer(first.from);
+    if (!open && (await this.answeredByTriage(first.from, question))) {
+      return;
+    }
     const id =
       open?.id ??
       this.store.createConsultation({
@@ -71,6 +78,7 @@ export class RelayService {
     if (open) {
       this.store.appendQuestion(id, question, last.id);
     }
+    const suggestion = await this.suggester.suggest(id, first.from);
     const result = await this.sender.sendText({
       to: operatorWaId,
       body: RelayMessages.notification(
@@ -79,11 +87,12 @@ export class RelayService {
         first.from,
         question,
         open !== undefined,
+        suggestion,
       ),
     });
 
     if (result.kind === 'sent') {
-      this.store.recordNotificationSent(id, result.messageId);
+      this.store.recordNotificationSent(id, result.messageId, suggestion);
       return;
     }
     this.logger.error(
@@ -94,6 +103,27 @@ export class RelayService {
       result.kind === 'rejected' ? 'notify_failed' : 'notify_unknown',
       result.reason,
     );
+  }
+
+  private async answeredByTriage(
+    customerWaId: string,
+    text: string,
+  ): Promise<boolean> {
+    const decision = await this.triage.decide(text);
+    if (decision.kind !== 'auto_reply') {
+      return false;
+    }
+    const result = await this.sender.sendText({
+      to: customerWaId,
+      body: decision.reply,
+    });
+    if (result.kind !== 'sent') {
+      this.logger.error(
+        `Automatic closing reply ${result.kind}: ${result.reason}; forwarding to the operator`,
+      );
+      return false;
+    }
+    return true;
   }
 
   private async handleOperatorReply(
@@ -118,7 +148,11 @@ export class RelayService {
         this.unavailableNotice(consultation),
       );
     }
-    await this.sendReply(consultation, message.text, operatorWaId);
+    const text =
+      consultation.suggestion !== undefined && isAcceptance(message.text)
+        ? consultation.suggestion
+        : message.text;
+    await this.sendReply(consultation, text, operatorWaId);
   }
 
   private async sendReply(
@@ -133,7 +167,7 @@ export class RelayService {
     });
 
     if (result.kind === 'sent') {
-      this.store.recordReply(consultation.id, 'replied', result.messageId);
+      this.store.recordReplySent(consultation.id, result.messageId, text);
     } else if (result.kind === 'rejected') {
       this.store.recordReply(
         consultation.id,
@@ -175,6 +209,10 @@ export class RelayService {
       this.logger.error(`Operator notice ${result.kind}: ${result.reason}`);
     }
   }
+}
+
+function isAcceptance(text: string): boolean {
+  return text.trim().toLowerCase() === 'ok';
 }
 
 type RelayUnit =

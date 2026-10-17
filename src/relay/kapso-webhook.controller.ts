@@ -8,25 +8,28 @@ import {
 } from '@nestjs/common';
 import { KapsoSignatureGuard } from '../webhooks/kapso-signature.guard.js';
 import { parseReceivedMessages } from './kapso-payload.js';
-import { RelayService } from './relay.service.js';
+import { RelayJobProcessor } from './relay-job.processor.js';
 
 const MESSAGE_RECEIVED = 'whatsapp.message.received';
 
 @Controller('webhooks')
 export class KapsoWebhookController {
-  constructor(private readonly relay: RelayService) {}
+  constructor(private readonly jobs: RelayJobProcessor) {}
 
   @Post('kapso')
   @HttpCode(200)
   @UseGuards(KapsoSignatureGuard)
-  async receive(
+  receive(
     @Headers('x-webhook-event') event: string | undefined,
     @Body() body: unknown,
-  ): Promise<{ status: 'ok' | 'ignored' }> {
+  ): { status: 'ok' | 'ignored' } {
     if (event !== MESSAGE_RECEIVED) {
       return { status: 'ignored' };
     }
-    await this.relay.handle(parseReceivedMessages(body));
+    const messages = parseReceivedMessages(body);
+    if (messages.length > 0) {
+      this.jobs.enqueue(messages);
+    }
     return { status: 'ok' };
   }
 }

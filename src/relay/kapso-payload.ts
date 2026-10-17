@@ -47,6 +47,23 @@ function parseReceivedMessage(payload: unknown): InboundMessage | undefined {
   };
 }
 
+export function isInboundMessage(value: unknown): value is InboundMessage {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.phoneNumberId === 'string' &&
+    typeof value.from === 'string' &&
+    typeof value.type === 'string' &&
+    isOptionalString(value.contactName) &&
+    isOptionalString(value.text) &&
+    isOptionalString(value.quotedMessageId)
+  );
+}
+
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || typeof value === 'string';
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
