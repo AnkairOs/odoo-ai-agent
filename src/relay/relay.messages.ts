@@ -1,4 +1,12 @@
+const ROUTES = 'Cita este mensaje: "ok" envía este borrador; otra instrucción pide un borrador privado; /enviar <texto> envía texto literal sin IA.';
+
 export const RelayMessages = {
+  proposal: (id: number, text: string) =>
+    `Consulta #${id} · Propongo enviar:\n\n${text}\n\n${ROUTES}\nNo se envió nada al cliente.`,
+  sendUsage: 'Uso: /enviar <texto> citando una consulta. No se envió nada.',
+  noDraft: 'No hay un borrador en el mensaje citado. Pide uno con una instrucción o usa /enviar <texto>. No se envió nada.',
+  staleDraft: 'Ese borrador fue reemplazado. Cita el último borrador para aprobarlo. No se envió nada.',
+  draftUnavailable: 'No pude preparar el borrador (IA desactivada o no disponible). Inténtalo de nuevo o usa /enviar <texto>. No se envió nada.',
   notification: (
     id: number,
     contactName: string,
@@ -9,8 +17,8 @@ export const RelayMessages = {
   ) => {
     const header = `Consulta #${id}${continuation ? ' (continúa)' : ''} · ${contactName} (…${waId.slice(-4)})\n\n${question}`;
     return suggestion === undefined
-      ? `${header}\n\nResponde citando este mensaje para contestarle.`
-      : `${header}\n\n💡 Sugerencia: ${suggestion}\n\nResponde "ok" citando este mensaje para enviar la sugerencia, o escribe tu propia respuesta.`;
+      ? `${header}\n\nSin borrador disponible. ${ROUTES}`
+      : `${header}\n\n💡 Sugerencia: ${suggestion}\n\n${ROUTES}`;
   },
   nonTextPlaceholder: (type: string) =>
     `[El cliente envió un mensaje de tipo ${type} sin texto]`,

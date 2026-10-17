@@ -227,6 +227,16 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
     );
   }
 
+  isCurrentNotification(id: number, messageId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT message_id FROM consultation_notifications
+         WHERE consultation_id = ? ORDER BY rowid DESC LIMIT 1`,
+      )
+      .get(id) as { message_id: string } | undefined;
+    return row?.message_id === messageId;
+  }
+
   customerHistory(
     customerWaId: string,
     excludedId: number,

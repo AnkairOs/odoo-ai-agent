@@ -142,16 +142,48 @@ export class RelayService {
     if (message.text === undefined) {
       return this.notifyOperator(operatorWaId, RelayMessages.onlyText);
     }
-    if (!this.store.claimForReply(consultation.id)) {
-      return this.notifyOperator(
-        operatorWaId,
-        this.unavailableNotice(consultation),
-      );
+    if (consultation.status !== 'awaiting_reply') {
+      return this.notifyOperator(operatorWaId, this.unavailableNotice(consultation));
     }
-    const text =
-      consultation.suggestion !== undefined && isAcceptance(message.text)
-        ? consultation.suggestion
-        : message.text;
+    const command = /^\s*\/enviar(?:\s([\s\S]*)|$)/u.exec(message.text);
+    let text: string;
+    if (command) {
+      text = command[1] ?? '';
+      if (!text.trim()) {
+        return this.notifyOperator(operatorWaId, RelayMessages.sendUsage);
+      }
+    } else if (isAcceptance(message.text)) {
+      if (consultation.suggestion === undefined) {
+        return this.notifyOperator(operatorWaId, RelayMessages.noDraft);
+      }
+      if (!this.store.isCurrentNotification(consultation.id, message.quotedMessageId!)) {
+        return this.notifyOperator(operatorWaId, RelayMessages.staleDraft);
+      }
+      text = consultation.suggestion;
+    } else {
+      const draft = await this.suggester.revise(
+        consultation.id,
+        consultation.customerWaId,
+        consultation.suggestion,
+        message.text,
+      );
+      if (draft === undefined) {
+        return this.notifyOperator(operatorWaId, RelayMessages.draftUnavailable);
+      }
+      const result = await this.sender.sendText({
+        to: operatorWaId,
+        body: RelayMessages.proposal(consultation.id, draft),
+      });
+      if (result.kind === 'sent') {
+        this.store.recordNotificationSent(consultation.id, result.messageId, draft);
+      } else {
+        this.logger.error(`Private draft ${result.kind}: ${result.reason}`);
+      }
+      return;
+    }
+    if (!this.store.claimForReply(consultation.id)) {
+      return this.notifyOperator(operatorWaId, this.unavailableNotice(consultation));
+    }
     await this.sendReply(consultation, text, operatorWaId);
   }
 

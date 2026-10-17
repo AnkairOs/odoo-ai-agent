@@ -57,6 +57,44 @@ export class ReplySuggester {
       : undefined;
   }
 
+  async revise(
+    consultationId: number,
+    customerWaId: string,
+    quotedDraft: string | undefined,
+    instruction: string,
+  ): Promise<string | undefined> {
+    const question = this.store.getQuestion(consultationId);
+    if (!this.ai.isEnabled() || question === undefined) {
+      return undefined;
+    }
+    try {
+      const result = await this.ai.generateWithTools({
+        system: `${SYSTEM_PROMPT}
+The final user message is a JSON object: question is the full current customer consultation; quotedDraft is the exact draft the operator quoted, if any; instruction is the private operator drafting/revision request.
+Follow the operator instruction to produce a new proposed customer reply, not a reply to the operator. The draft is context, not proof of business facts.
+Use operator-supplied facts (such as a price), but never infer stock, delivery times, discounts or promises from a price instruction. Do not add unsupported facts. Never claim a message was sent. Return only the proposed customer text.`,
+        messages: [
+          ...this.priorMessages(consultationId, customerWaId),
+          {
+            role: 'user',
+            content: JSON.stringify({ question, quotedDraft, instruction }),
+          },
+        ],
+        tools: this.tools(consultationId, customerWaId),
+      });
+      if (!result.ok) {
+        return undefined;
+      }
+      const text = result.text.trim();
+      return text.length > 0 && text.length <= MAX_SUGGESTION_LENGTH
+        ? text
+        : undefined;
+    } catch {
+      this.logger.warn('Operator draft unavailable');
+      return undefined;
+    }
+  }
+
   private priorMessages(
     consultationId: number,
     customerWaId: string,
