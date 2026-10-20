@@ -8,6 +8,77 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InboundMessage, isInboundMessage } from './kapso-payload.js';
+import { z } from 'zod';
+import {
+  conversationProductSchema, costSchema, newProductSchema, salePriceSchema, sameProductDestination, taxIdSchema,
+  type ConversationProduct, type NewProduct, type ProductDestination,
+} from '../odoo/odoo-product-creation.service.js';
+import { saleTaxSchema } from '../odoo/odoo-taxes.service.js';
+import type { ModelMessage } from 'ai';
+
+const conversationPriceSchema = z.object({
+  amount: salePriceSchema,
+  includesTax: z.boolean(),
+  requestedTaxId: taxIdSchema.optional(),
+  tax: saleTaxSchema,
+  listPrice: salePriceSchema,
+}).strict();
+export type ConversationPrice = z.infer<typeof conversationPriceSchema>;
+
+export interface ConversationAction extends NewProduct, ProductDestination {
+  price?: ConversationPrice;
+  cost?: number;
+  id: string;
+  approvalId: string;
+  authorityFingerprint: string;
+  toolCallId: string;
+  expiresAt: number;
+  status: 'proposed' | 'pending' | 'approved' | 'creating' | 'created' | 'cancelled' | 'rejected' | 'unknown';
+  visibleMessageId?: string;
+  productId?: number;
+}
+
+export interface OperatorConversation {
+  messages: ModelMessage[];
+  action?: ConversationAction;
+  busy?: string;
+}
+
+export const MAX_CONVERSATION_MESSAGES = 40;
+export const MAX_CONVERSATION_BYTES = 64_000;
+
+function hasApprovalChain(messages: ModelMessage[], approvalId: string, toolCallId: string): boolean {
+  return messages.some((message) => message.role === 'assistant' && Array.isArray(message.content) &&
+    message.content.some((part) => part.type === 'tool-approval-request' && part.approvalId === approvalId &&
+      part.toolCallId === toolCallId) && message.content.some((part) => part.type === 'tool-call' &&
+        part.toolCallId === toolCallId && part.toolName === 'create_product'));
+}
+
+function matchesRequest(action: ConversationAction, input: ConversationProduct): boolean {
+  return action.name === input.name && action.reference === input.reference &&
+    action.price?.amount === input.salePrice && action.price?.includesTax === input.priceIncludesTax &&
+    action.price?.requestedTaxId === input.taxId && action.cost === input.cost;
+}
+
+export function boundConversation(messages: ModelMessage[]): ModelMessage[] | undefined {
+  let start = 0;
+  while (messages.length - start > MAX_CONVERSATION_MESSAGES ||
+    Buffer.byteLength(JSON.stringify(messages.slice(start))) > MAX_CONVERSATION_BYTES) {
+    const next = messages.findIndex((message, index) => index > start && message.role === 'user');
+    if (next === -1) return undefined;
+    start = next;
+  }
+  return messages.slice(start);
+}
+
+export interface ProductPreview extends NewProduct, ProductDestination {
+  messageId: string;
+  operator: string;
+  businessPhone: string;
+  expiresAt: number;
+  status: 'pending' | 'creating' | 'created' | 'cancelled' | 'rejected' | 'unknown';
+  productId?: number;
+}
 
 export type ConsultationStatus =
   | 'notifying'
@@ -56,6 +127,34 @@ interface ConsultationRow {
 const DEFAULT_DB_PATH = 'data/relay.sqlite';
 
 const SCHEMA = `
+  CREATE TABLE IF NOT EXISTS operator_conversations (
+    operator TEXT NOT NULL,
+    business_phone TEXT NOT NULL,
+    messages TEXT NOT NULL DEFAULT '[]',
+    action TEXT,
+    busy TEXT,
+    PRIMARY KEY (operator, business_phone)
+  );
+  CREATE TABLE IF NOT EXISTS operator_conversation_events (
+    operator TEXT NOT NULL,
+    business_phone TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    PRIMARY KEY (operator, business_phone, event_id)
+  );
+  CREATE TABLE IF NOT EXISTS operator_product_previews (
+    message_id TEXT PRIMARY KEY,
+    proposal_event_id TEXT NOT NULL UNIQUE,
+    operator TEXT NOT NULL,
+    business_phone TEXT NOT NULL,
+    name TEXT NOT NULL,
+    reference TEXT,
+    url TEXT NOT NULL,
+    db TEXT NOT NULL,
+    company_id INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    product_id INTEGER
+  );
   CREATE TABLE IF NOT EXISTS processed_messages (
     message_id TEXT PRIMARY KEY,
     processed_at TEXT NOT NULL
@@ -152,6 +251,141 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
       )
       .run(messageId, now());
     return result.changes === 1;
+  }
+
+  getOperatorConversation(operator: string, businessPhone: string): OperatorConversation {
+    const row = this.db.prepare(`SELECT messages, action, busy FROM operator_conversations
+      WHERE operator = ? AND business_phone = ?`).get(operator, businessPhone) as
+      { messages: string; action: string | null; busy: string | null } | undefined;
+    return row ? { messages: JSON.parse(row.messages) as ModelMessage[],
+      action: row.action ? JSON.parse(row.action) as ConversationAction : undefined,
+      busy: row.busy ?? undefined } : { messages: [] };
+  }
+
+  claimConversationTurn(operator: string, businessPhone: string, eventId: string): boolean {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare(`INSERT OR IGNORE INTO operator_conversations (operator, business_phone)
+        VALUES (?, ?)`).run(operator, businessPhone);
+      const locked = this.db.prepare(`UPDATE operator_conversations SET busy = ?
+        WHERE operator = ? AND business_phone = ? AND busy IS NULL`).run(eventId, operator, businessPhone);
+      const fresh = locked.changes === 1 && this.db.prepare(`INSERT OR IGNORE INTO operator_conversation_events
+        (operator, business_phone, event_id) VALUES (?, ?, ?)`).run(operator, businessPhone, eventId).changes === 1;
+      this.db.exec(fresh ? 'COMMIT' : 'ROLLBACK');
+      return fresh;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  releaseConversationTurn(operator: string, businessPhone: string, eventId: string): void {
+    this.db.prepare(`UPDATE operator_conversations SET busy = NULL
+      WHERE operator = ? AND business_phone = ? AND busy = ?`).run(operator, businessPhone, eventId);
+  }
+
+  saveConversationMessages(operator: string, businessPhone: string, eventId: string, messages: ModelMessage[]): boolean {
+    const state = this.getOperatorConversation(operator, businessPhone);
+    if (state.busy !== eventId) return false;
+    const bounded = boundConversation(messages);
+    if (!bounded) return false;
+    // An unresolved native approval chain must never be partially pruned.
+    if (state.action && ['proposed', 'pending', 'approved', 'creating', 'unknown'].includes(state.action.status) &&
+      !hasApprovalChain(bounded, state.action.approvalId, state.action.toolCallId)) return false;
+    return this.db.prepare(`UPDATE operator_conversations SET messages = ?
+      WHERE operator = ? AND business_phone = ? AND busy = ?`)
+      .run(JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
+  }
+
+  reserveConversationAction(operator: string, businessPhone: string, eventId: string,
+    action: Omit<ConversationAction, 'status' | 'visibleMessageId' | 'productId'>, messages: ModelMessage[]): boolean {
+    const state = this.getOperatorConversation(operator, businessPhone);
+    const product = newProductSchema.safeParse({ name: action.name,
+      ...(action.reference === undefined ? {} : { reference: action.reference }) });
+    const price = conversationPriceSchema.optional().safeParse(action.price);
+    const cost = costSchema.optional().safeParse(action.cost);
+    const bounded = boundConversation(messages);
+    if (state.busy !== eventId || !product.success || !price.success || !cost.success || !bounded ||
+      !hasApprovalChain(bounded, action.approvalId, action.toolCallId) ||
+      (state.action && !['created', 'cancelled', 'rejected'].includes(state.action.status))) return false;
+    return this.db.prepare(`UPDATE operator_conversations SET action = ?, messages = ?
+      WHERE operator = ? AND business_phone = ? AND busy = ?`).run(
+        JSON.stringify({ ...action, ...product.data, status: 'proposed' }), JSON.stringify(bounded),
+        operator, businessPhone, eventId).changes === 1;
+  }
+
+  bindConversationPreview(operator: string, businessPhone: string, eventId: string, actionId: string, messageId: string): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
+      action.status === 'proposed' && messageId ? { ...action, status: 'pending', visibleMessageId: messageId } : undefined);
+  }
+
+  cancelConversationAction(operator: string, businessPhone: string, eventId: string, actionId: string): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
+      ['proposed', 'pending'].includes(action.status) ? { ...action, status: 'cancelled' } : undefined);
+  }
+
+  authorizeConversationAction(operator: string, businessPhone: string, eventId: string, actionId: string,
+    target: ProductDestination, timestamp: number): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
+      action.status === 'pending' && action.visibleMessageId && action.expiresAt > timestamp &&
+        sameProductDestination(action, target) ? { ...action, status: 'approved' } : undefined);
+  }
+
+  claimConversationCreation(operator: string, businessPhone: string, eventId: string, actionId: string,
+    toolCallId: string, input: ConversationProduct, target: ProductDestination, timestamp: number): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
+      conversationProductSchema.safeParse(input).success && action.status === 'approved' && action.visibleMessageId && action.expiresAt > timestamp &&
+        action.toolCallId === toolCallId && matchesRequest(action, input) &&
+        sameProductDestination(action, target) ? { ...action, status: 'creating' } : undefined);
+  }
+
+  finishConversationCreation(operator: string, businessPhone: string, eventId: string, actionId: string,
+    status: 'created' | 'rejected' | 'unknown', productId?: number): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
+      action.status === 'creating' && (status !== 'created' || (Number.isSafeInteger(productId) && productId! > 0))
+        ? { ...action, status, ...(status === 'created' ? { productId } : {}) } : undefined);
+  }
+
+  private updateConversationAction(operator: string, businessPhone: string, eventId: string, actionId: string,
+    update: (action: ConversationAction) => ConversationAction | undefined): boolean {
+    const state = this.getOperatorConversation(operator, businessPhone);
+    if (state.busy !== eventId || state.action?.id !== actionId) return false;
+    const changed = update(state.action);
+    if (!changed) return false;
+    return this.db.prepare(`UPDATE operator_conversations SET action = ?
+      WHERE operator = ? AND business_phone = ? AND busy = ? AND action = ?`)
+      .run(JSON.stringify(changed), operator, businessPhone, eventId, JSON.stringify(state.action)).changes === 1;
+  }
+
+  recordProductPreview(preview: Omit<ProductPreview, 'status' | 'productId'>, proposalEventId: string): boolean {
+    const result = this.db.prepare(`INSERT OR IGNORE INTO operator_product_previews
+      (message_id, proposal_event_id, operator, business_phone, name, reference, url, db, company_id, expires_at, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`)
+      .run(preview.messageId, proposalEventId, preview.operator, preview.businessPhone,
+        preview.name, preview.reference ?? null, preview.url, preview.db, preview.companyId, preview.expiresAt);
+    return result.changes === 1;
+  }
+
+  findProductPreview(messageId: string): ProductPreview | undefined {
+    const row = this.db.prepare(`SELECT message_id AS messageId, operator, business_phone AS businessPhone,
+      name, reference, url, db, company_id AS companyId, expires_at AS expiresAt, status, product_id AS productId
+      FROM operator_product_previews WHERE message_id = ?`).get(messageId) as
+      (Omit<ProductPreview, 'reference' | 'productId'> & { reference: string | null; productId: number | null }) | undefined;
+    return row ? { ...row, reference: row.reference ?? undefined, productId: row.productId ?? undefined } : undefined;
+  }
+
+  claimProductPreview(messageId: string, operator: string, businessPhone: string,
+    target: ProductDestination, status: 'creating' | 'cancelled', timestamp: number): boolean {
+    const result = this.db.prepare(`UPDATE operator_product_previews SET status = ?
+      WHERE message_id = ? AND operator = ? AND business_phone = ? AND url = ? AND db = ?
+      AND company_id = ? AND status = 'pending' AND expires_at > ?`)
+      .run(status, messageId, operator, businessPhone, target.url, target.db, target.companyId, timestamp);
+    return result.changes === 1;
+  }
+
+  finishProductCreation(messageId: string, status: 'created' | 'rejected' | 'unknown', productId?: number): void {
+    this.db.prepare(`UPDATE operator_product_previews SET status = ?, product_id = ?
+      WHERE message_id = ? AND status = 'creating'`).run(status, productId ?? null, messageId);
   }
 
   createConsultation(input: {

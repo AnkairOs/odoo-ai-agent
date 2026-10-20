@@ -1,4 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import { OperatorProductsService } from './operator-products.service.js';
+import { OperatorConversationService } from './operator-conversation.service.js';
 import { ConfigService } from '@nestjs/config';
 import { CustomerTriage } from './customer-triage.js';
 import { InboundMessage } from './kapso-payload.js';
@@ -18,6 +20,8 @@ export class RelayService {
     @Inject(WHATSAPP_SENDER) private readonly sender: WhatsAppSender,
     private readonly triage: CustomerTriage,
     private readonly suggester: ReplySuggester,
+    private readonly products: OperatorProductsService,
+    private readonly conversation: OperatorConversationService,
   ) {}
 
   async handle(messages: InboundMessage[]): Promise<void> {
@@ -130,6 +134,8 @@ export class RelayService {
     message: InboundMessage,
     operatorWaId: string,
   ): Promise<void> {
+    if (await this.products.handle(message)) return;
+    if (await this.conversation.handle(message)) return;
     const consultation = message.quotedMessageId
       ? this.store.findByNotification(message.quotedMessageId)
       : undefined;
