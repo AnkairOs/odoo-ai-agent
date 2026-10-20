@@ -192,11 +192,12 @@ export class OdooClientService {
   }
 
   private async extractErrorPayload(response: Response): Promise<string> {
+    const body = await response.text();
     try {
-      const errorJson = (await response.json()) as unknown;
+      const errorJson: unknown = JSON.parse(body);
       return JSON.stringify(errorJson);
     } catch {
-      return await response.text();
+      return body;
     }
   }
 }
