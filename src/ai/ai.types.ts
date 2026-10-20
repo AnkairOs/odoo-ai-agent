@@ -1,4 +1,4 @@
-import { tool, type ToolSet } from 'ai';
+import { tool, type ModelMessage, type ToolSet } from 'ai';
 import type { z } from 'zod';
 import type { TokenUsage } from './ai-provider.interface.js';
 
@@ -40,6 +40,29 @@ export interface ToolLoopRequest {
 export type ToolLoopResult = AiResult<{
   text: string;
   toolsExecuted: string[];
+  usage: TokenUsage;
+}>;
+
+export interface ConversationRequest {
+  system: string;
+  messages: ModelMessage[];
+  tools: AiToolSet;
+  approvalRequiredTools: string[];
+  maxSteps?: number;
+  timeoutMs?: number;
+}
+
+export interface ConversationApproval {
+  approvalId: string;
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+}
+
+export type ConversationResult = AiResult<{
+  text: string;
+  messages: ModelMessage[];
+  approvals: ConversationApproval[];
   usage: TokenUsage;
 }>;
 

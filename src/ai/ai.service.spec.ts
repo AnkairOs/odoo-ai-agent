@@ -70,6 +70,62 @@ const triageSchema = z.object({
 
 const userMessages = [{ role: 'user' as const, content: 'gracias' }];
 
+describe('AiService native conversations', () => {
+  it('returns full SDK tool-cycle messages and reuses them on a follow-up', async () => {
+    const execute = vi.fn(async () => ({ products: [{ name: 'Pioneer', reference: 'DDJ' }] }));
+    const model = new MockLanguageModelV4({ doGenerate: [
+      toolCallResult('search_products', { query: 'Pioneer' }), textResult('Encontré Pioneer.'), textResult('DDJ'),
+    ] });
+    const { service } = createService(ENABLED_ENV, model);
+    const tools = { search_products: defineAiTool({ inputSchema: z.object({ query: z.string() }), execute }) };
+    const first = await service.generateConversation({ system: 's', messages: userMessages, tools, approvalRequiredTools: [] });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.messages.map((message) => message.role)).toEqual(['assistant', 'tool', 'assistant']);
+    expect(execute).toHaveBeenCalledTimes(1);
+    const next = await service.generateConversation({ system: 's', messages: [...userMessages, ...first.messages,
+      { role: 'user', content: '¿Referencia?' }], tools, approvalRequiredTools: [] });
+    expect(next).toMatchObject({ ok: true, text: 'DDJ' });
+    expect(JSON.stringify(model.doGenerateCalls[2].prompt)).toContain('DDJ');
+  });
+
+  it('approval-only output is valid and only a native approval response executes the stored call', async () => {
+    const execute = vi.fn(async () => ({ status: 'created', id: 81 }));
+    const model = new MockLanguageModelV4({ doGenerate: [
+      toolCallResult('create_product', { name: 'Pioneer' }), textResult('Creado'),
+    ] });
+    const { service } = createService(ENABLED_ENV, model);
+    const tools = { create_product: defineAiTool({ inputSchema: z.object({ name: z.string() }).strict(), execute }) };
+    const first = await service.generateConversation({ system: 's', messages: userMessages, tools,
+      approvalRequiredTools: ['create_product'] });
+    expect(first).toMatchObject({ ok: true, text: '', approvals: [{ toolName: 'create_product', input: { name: 'Pioneer' } }] });
+    expect(execute).not.toHaveBeenCalled();
+    if (!first.ok) return;
+    const next = await service.generateConversation({ system: 's', tools, approvalRequiredTools: ['create_product'],
+      messages: [...userMessages, { role: 'user', content: 'sí, créalo' }, ...first.messages,
+        { role: 'tool', content: [{ type: 'tool-approval-response', approvalId: first.approvals[0].approvalId, approved: true }] }],
+    });
+    expect(next).toMatchObject({ ok: true, text: 'Creado' });
+    expect(execute).toHaveBeenCalledExactlyOnceWith({ name: 'Pioneer' }, expect.objectContaining({ toolCallId: 'call-create_product' }));
+    if (next.ok) expect(next.messages.map((message) => message.role)).toEqual(['tool', 'assistant']);
+  });
+
+  it('never executes denied native calls', async () => {
+    const execute = vi.fn(async () => 'not allowed');
+    const model = new MockLanguageModelV4({ doGenerate: [toolCallResult('create_product', { name: 'Pioneer' }), textResult('Cancelado')] });
+    const { service } = createService(ENABLED_ENV, model);
+    const tools = { create_product: defineAiTool({ inputSchema: z.object({ name: z.string() }), execute }) };
+    const first = await service.generateConversation({ system: 's', messages: userMessages, tools, approvalRequiredTools: ['create_product'] });
+    if (!first.ok) throw new Error('expected approval request');
+    const next = await service.generateConversation({ system: 's', tools, approvalRequiredTools: ['create_product'],
+      messages: [...userMessages, { role: 'user', content: 'no' }, ...first.messages,
+        { role: 'tool', content: [{ type: 'tool-approval-response', approvalId: first.approvals[0].approvalId, approved: false }] }],
+    });
+    expect(next).toMatchObject({ ok: true, text: 'Cancelado' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+});
+
 describe('AiService configuration', () => {
   it('is disabled unless AI_ENABLED is exactly "true"', () => {
     for (const value of ['', 'TRUE', '1', 'yes', 'false']) {

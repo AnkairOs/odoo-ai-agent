@@ -21,6 +21,8 @@ import type { TokenUsage } from './ai-provider.interface.js';
 import type {
   AiFailure,
   AiMessage,
+  ConversationRequest,
+  ConversationResult,
   StructuredRequest,
   StructuredResult,
   ToolLoopRequest,
@@ -117,6 +119,35 @@ export class AiService {
         };
       },
     );
+  }
+
+  async generateConversation(request: ConversationRequest): Promise<ConversationResult> {
+    const binding = this.binding;
+    if (!binding) return disabled();
+    return this.withTimeout(request.timeoutMs, async (abortSignal) => {
+      const result = await generateText({
+        model: binding.model,
+        system: request.system,
+        messages: request.messages,
+        tools: request.tools,
+        toolApproval: ({ toolCall }) => request.approvalRequiredTools.includes(toolCall.toolName)
+          ? 'user-approval' : 'not-applicable',
+        stopWhen: stepCountIs(request.maxSteps ?? DEFAULT_MAX_STEPS),
+        maxRetries: MAX_RETRIES,
+        abortSignal,
+      });
+      const approvals = result.steps.flatMap((step) => step.content.flatMap((part) =>
+        part.type === 'tool-approval-request' && !part.isAutomatic
+          ? [{ approvalId: part.approvalId, toolCallId: part.toolCall.toolCallId,
+            toolName: part.toolCall.toolName, input: part.toolCall.input }]
+          : []));
+      if (!result.text.trim() && approvals.length === 0) {
+        return { ok: false as const, reason: 'invalid_output' as const,
+          detail: 'No conversation answer or approval request' };
+      }
+      return { ok: true as const, text: result.text, messages: result.responseMessages,
+        approvals, usage: toTokenUsage(result.totalUsage) };
+    });
   }
 
   private async withTimeout<T>(
