@@ -18,6 +18,8 @@ import type {
 import { RelayJobProcessor } from './relay-job.processor.js';
 import { RelayModule } from './relay.module.js';
 import { RelayStore } from './relay.store.js';
+import { RelayService } from './relay.service.js';
+import { ReplySuggester } from './reply-suggester.js';
 import {
   OutgoingText,
   SendResult,
@@ -55,6 +57,19 @@ class FakeAi {
       detail: 'no fake result queued',
     };
     return next as StructuredResult<T>;
+  }
+
+  readonly conversationCalls: unknown[] = [];
+
+  async generateConversation(request: unknown) {
+    this.conversationCalls.push(request);
+    return {
+      ok: true,
+      text: 'Hola. Puedo conversar contigo; no hay operaciones Odoo disponibles.',
+      messages: [{ role: 'assistant', content: 'Hola. Puedo conversar contigo; no hay operaciones Odoo disponibles.' }],
+      approvals: [],
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    };
   }
 
   readonly toolCalls: ToolLoopRequest[] = [];
@@ -195,6 +210,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
   let sender: FakeSender;
   let ai: FakeAi;
   let jobs: RelayJobProcessor;
+  let productConfig: Record<string, string> = {};
 
   async function start() {
     sender = new FakeSender();
@@ -210,6 +226,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
               KAPSO_PHONE_NUMBER_ID: BUSINESS_PHONE_ID,
               RELAY_OPERATOR_WA_ID: OPERATOR,
               RELAY_DB_PATH: dbPath,
+              ...productConfig,
             }),
           ],
         }),
@@ -291,12 +308,22 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
     dir = mkdtempSync(join(tmpdir(), 'relay-'));
     dbPath = join(dir, 'relay.sqlite');
     ai = new FakeAi();
+    productConfig = {};
     await start();
   });
 
   afterEach(async () => {
     await app.close();
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('routes ordinary unquoted operator greetings to a private tool-aware conversation', async () => {
+    ai.enabled = true;
+    await deliver(inbound({ id: 'HELLO', from: OPERATOR, body: 'Hola, ¿qué puedes hacer?' })).expect(200);
+    expect(sender.sent).toEqual([{ to: OPERATOR, body: 'Hola. Puedo conversar contigo; no hay operaciones Odoo disponibles.' }]);
+    expect(ai.conversationCalls).toHaveLength(1);
+    expect(ai.toolCalls).toHaveLength(0);
+    expect(app.get(RelayStore).findOpenForCustomer(OPERATOR)).toBeUndefined();
   });
 
   it('notifies the operator with a numbered consultation and the exact customer text', async () => {
@@ -982,6 +1009,185 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
     });
   });
 
+  describe('operator-only product creation', () => {
+    let fetchMock: ReturnType<typeof vi.fn<typeof fetch>>;
+
+    beforeEach(async () => {
+      await app.close();
+      productConfig = {
+        ODOO_PRODUCT_CREATION_ENABLED: 'true', ODOO_PRODUCT_COMPANY_ID: '1',
+        ODOO_DEFAULT_URL: 'https://odoo.invalid', ODOO_DEFAULT_DB: 'test', ODOO_DEFAULT_API_KEY: 'fake-key',
+      };
+      await start();
+      fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response('[42]'));
+      vi.stubGlobal('fetch', fetchMock);
+    });
+
+    afterEach(() => vi.unstubAllGlobals());
+
+    it('uses the real DI wiring with AI disabled and deduplicates initiation and confirmation events', async () => {
+      const proposal = inbound({ id: 'PRODUCT', from: OPERATOR, body: '/producto Pioneer\nref: DDJ' });
+      await deliver(proposal).expect(200);
+      await deliver(proposal).expect(200);
+      expect(sender.to(OPERATOR)).toHaveLength(1);
+      expect(sender.to(OPERATOR)[0].body).toContain('Tipo: bien sin seguimiento de inventario');
+      expect(fetchMock).not.toHaveBeenCalled();
+      for (const body of ['ok', '/enviar literal']) {
+        await deliver(inbound({ id: body, from: OPERATOR, body, contextId: 'wamid.OUT1' })).expect(200);
+      }
+      expect(fetchMock).not.toHaveBeenCalled();
+      const confirmation = inbound({ id: 'CONFIRM', from: OPERATOR, body: '/confirmar_producto', contextId: 'wamid.OUT1' });
+      await deliver(confirmation).expect(200);
+      await deliver(confirmation).expect(200);
+      await deliver(inbound({ id: 'CONFIRM2', from: OPERATOR, body: '/confirmar_producto', contextId: 'wamid.OUT1' })).expect(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({ vals_list: [
+        { name: 'Pioneer', default_code: 'DDJ', type: 'consu', is_storable: false, company_id: 1 },
+      ] });
+      expect(sender.sent.every((message) => message.to === OPERATOR)).toBe(true);
+      expect(app.get(RelayStore).customerHistory(CUSTOMER_A, 0)).toEqual([]);
+      expect(ai.structuredCalls).toEqual([]);
+      expect(ai.toolCalls).toEqual([]);
+    });
+
+    it('treats quoted /producto as a consultation revision, never as a confirmable product', async () => {
+      const relay = app.get(RelayService);
+      const store = app.get(RelayStore);
+      const revise = vi.spyOn(app.get(ReplySuggester), 'revise');
+      try {
+        await relay.handle([{
+          id: 'QUOTED_CUSTOMER', from: CUSTOMER_A, phoneNumberId: BUSINESS_PHONE_ID,
+          type: 'text', text: '¿Tienen Pioneer?',
+        }]);
+        const history = store.customerHistory(CUSTOMER_A, 0);
+        const quote = notificationId(notificationFor('¿Tienen Pioneer?'));
+        ai.enabled = true;
+        ai.suggest(suggestion('Déjame confirmar Pioneer.'));
+
+        await relay.handle([{
+          id: 'QUOTED_PRODUCT', from: OPERATOR, phoneNumberId: BUSINESS_PHONE_ID,
+          type: 'text', text: '/producto Quoted product', quotedMessageId: quote,
+        }]);
+
+        expect(revise).toHaveBeenCalledExactlyOnceWith(1, CUSTOMER_A, undefined, '/producto Quoted product');
+        expect(ai.toolCalls).toHaveLength(1);
+        expect(ai.toolCalls[0].messages).toEqual([{
+          role: 'user', content: JSON.stringify({ question: '¿Tienen Pioneer?', instruction: '/producto Quoted product' }),
+        }]);
+        expect(sender.to(OPERATOR)).toHaveLength(2);
+        expect(sender.to(OPERATOR).at(-1)).toEqual({
+          to: OPERATOR,
+          body: `Consulta #1 · Propongo enviar:\n\nDéjame confirmar Pioneer.\n\n${ROUTES}\nNo se envió nada al cliente.`,
+        });
+        const revisionId = notificationId(sender.to(OPERATOR).at(-1)!);
+        expect(store.findProductPreview(quote)).toBeUndefined();
+        expect(store.findProductPreview(revisionId)).toBeUndefined();
+        expect(store.customerHistory(CUSTOMER_A, 0)).toEqual(history);
+        expect(store.getStatus(1)).toBe('awaiting_reply');
+        expect(sender.to(CUSTOMER_A)).toEqual([]);
+        expect(fetchMock).not.toHaveBeenCalled();
+
+        await relay.handle([{
+          id: 'CONFIRM_REVISION', from: OPERATOR, phoneNumberId: BUSINESS_PHONE_ID,
+          type: 'text', text: '/confirmar_producto', quotedMessageId: revisionId,
+        }]);
+
+        expect(sender.to(OPERATOR).at(-1)).toEqual({
+          to: OPERATOR,
+          body: 'Uso privado: /producto <nombre> (máx. 120 caracteres), con segunda línea opcional ref: <referencia> (máx. 255). Cita la vista previa con /confirmar_producto o /cancelar_producto. No se creó nada.',
+        });
+        expect(revise).toHaveBeenCalledTimes(1);
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(sender.to(CUSTOMER_A)).toEqual([]);
+        expect(store.findProductPreview(revisionId)).toBeUndefined();
+        expect(store.customerHistory(CUSTOMER_A, 0)).toEqual(history);
+        expect(store.searchPastAnswers(['Pioneer'])).toEqual([]);
+        expect(store.getStatus(1)).toBe('awaiting_reply');
+      } finally {
+        revise.mockRestore();
+      }
+    });
+
+    it('never initiates another proposal when /producto quotes an existing product preview', async () => {
+      const relay = app.get(RelayService);
+      const store = app.get(RelayStore);
+      await relay.handle([{
+        id: 'ORIGINAL_PRODUCT', from: OPERATOR, phoneNumberId: BUSINESS_PHONE_ID,
+        type: 'text', text: '/producto Original product',
+      }]);
+      const original = store.findProductPreview('wamid.OUT1');
+      expect(original).toMatchObject({ name: 'Original product', status: 'pending' });
+
+      await relay.handle([{
+        id: 'NESTED_PRODUCT', from: OPERATOR, phoneNumberId: BUSINESS_PHONE_ID,
+        type: 'text', text: '/producto Quoted product', quotedMessageId: 'wamid.OUT1',
+      }]);
+
+      expect(sender.sent).toHaveLength(2);
+      expect(sender.sent[1]).toEqual({
+        to: OPERATOR,
+        body: 'Uso privado: /producto <nombre> (máx. 120 caracteres), con segunda línea opcional ref: <referencia> (máx. 255). Cita la vista previa con /confirmar_producto o /cancelar_producto. No se creó nada.',
+      });
+      expect(store.findProductPreview('wamid.OUT1')).toEqual(original);
+      expect(store.findProductPreview('wamid.OUT2')).toBeUndefined();
+      expect(store.customerHistory(CUSTOMER_A, 0)).toEqual([]);
+      expect(sender.to(CUSTOMER_A)).toEqual([]);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(ai.toolCalls).toEqual([]);
+    });
+
+    it('keeps customer commands in the existing consultation flow and rejects other business phones', async () => {
+      await deliver(inbound({ id: 'OTHER', from: OPERATOR, body: '/producto Pioneer', phoneNumberId: 'other' })).expect(200);
+      expect(sender.sent).toEqual([]);
+      await deliver(inbound({ id: 'CUSTOMER', from: CUSTOMER_A, body: '/producto Pioneer' })).expect(200);
+      expect(sender.to(OPERATOR)[0].body).toBe(`Consulta #1 · Cliente (…1111)\n\n/producto Pioneer\n\nSin borrador disponible. ${ROUTES}`);
+      await deliver(inbound({ id: 'CUSTOMERCONFIRM', from: CUSTOMER_B, body: '/confirmar_producto', contextId: 'wamid.OUT1' })).expect(200);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(sender.to(CUSTOMER_A)).toEqual([]);
+      expect(app.get(RelayStore).getStatus(1)).toBe('awaiting_reply');
+    });
+
+    it.each(['unknown', 'rejected'] as const)('does not replay a failed preview after restart: %s', async (kind) => {
+      sender.failNext({ kind, reason: 'failed' });
+      const proposal = inbound({ id: 'FAILEDPRODUCT', from: OPERATOR, body: '/producto Pioneer' });
+      await deliver(proposal).expect(200);
+      await app.close();
+      await start();
+      await deliver(proposal).expect(200);
+      expect(sender.sent).toEqual([]);
+      await deliver(inbound({ id: 'AFTERFAIL', from: OPERATOR, body: '/confirmar_producto', contextId: 'wamid.OUT1' })).expect(200);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(app.get(RelayStore).findProductPreview('wamid.OUT1')).toBeUndefined();
+    });
+
+    it('allows a fresh explicit proposal for the same name but never replays a created preview after restart', async () => {
+      await deliver(inbound({ id: 'P1', from: OPERATOR, body: '/producto Pioneer' })).expect(200);
+      const confirmation = inbound({ id: 'C1', from: OPERATOR, body: '/confirmar_producto', contextId: 'wamid.OUT1' });
+      await deliver(confirmation).expect(200);
+      await app.close();
+      await start();
+      await deliver(confirmation).expect(200);
+      await deliver(inbound({ id: 'C2', from: OPERATOR, body: '/confirmar_producto', contextId: 'wamid.OUT1' })).expect(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(app.get(RelayStore).findProductPreview('wamid.OUT1')?.status).toBe('created');
+      await deliver(inbound({ id: 'P2', from: OPERATOR, body: '/producto Pioneer' })).expect(200);
+      // The restarted fake sender's first notice reuses OUT1; the new preview is OUT2.
+      await deliver(inbound({ id: 'C3', from: OPERATOR, body: '/confirmar_producto', contextId: 'wamid.OUT2' })).expect(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('leaves ordinary ok and literal /enviar consultation semantics unchanged', async () => {
+      await deliver(inbound({ id: 'A', from: CUSTOMER_A, body: 'price' })).expect(200);
+      const quote = notificationId(notificationFor('price'));
+      await deliver(inbound({ id: 'OK', from: OPERATOR, body: 'ok', contextId: quote })).expect(200);
+      expect(sender.to(CUSTOMER_A)).toEqual([]);
+      expect(app.get(RelayStore).getStatus(1)).toBe('awaiting_reply');
+      await deliver(inbound({ id: 'SEND', from: OPERATOR, body: '/enviar /producto literal', contextId: quote })).expect(200);
+      expect(sender.to(CUSTOMER_A)).toEqual([{ to: CUSTOMER_A, body: '/producto literal', contextMessageId: 'A' }]);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  });
+
   describe('F1 social triage', () => {
     beforeEach(() => {
       ai.enabled = true;
@@ -1292,8 +1498,42 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       );
       expect(Object.keys(ai.toolCalls[0]?.tools ?? {}).sort()).toEqual([
         'get_customer_history',
+        'search_odoo_products',
         'search_past_answers',
       ]);
+    });
+
+    it('keeps lookup failure private through initial draft, revision and explicit approval', async () => {
+      const fetchMock = vi.fn<typeof fetch>();
+      vi.stubGlobal('fetch', fetchMock);
+      try {
+        vi.spyOn(ai, 'generateWithTools').mockImplementation(async (request) => {
+          expect(await runTool(request, 'search_odoo_products', { query: 'Cable' }))
+            .toEqual({ status: 'unavailable' });
+          return suggestion('Déjame confirmar el producto.');
+        });
+        await askWithSuggestion('wamid.A1', '¿Cable CB1?', undefined);
+        const initial = notificationId(notificationFor('¿Cable CB1?'));
+        expect(sender.to(CUSTOMER_A)).toEqual([]);
+        await operatorSays('wamid.REV', 'Busca Cable CB1', initial);
+        expect(sender.to(CUSTOMER_A)).toEqual([]);
+        const store = app.get(RelayStore);
+        expect(store.getStatus(1)).toBe('awaiting_reply');
+        expect(store.customerHistory(CUSTOMER_A, 0)[0]?.reply).toBeNull();
+        expect(store.searchPastAnswers(['producto'])).toEqual([]);
+        const revised = notificationId(sender.to(OPERATOR).at(-1)!);
+        await operatorSays('wamid.OK', 'ok', revised);
+        expect(sender.to(CUSTOMER_A)).toEqual([
+          { to: CUSTOMER_A, body: 'Déjame confirmar el producto.', contextMessageId: 'wamid.A1' },
+        ]);
+        expect(store.searchPastAnswers(['producto'])).toEqual([
+          { question: '¿Cable CB1?', reply: 'Déjame confirmar el producto.' },
+        ]);
+        expect(fetchMock).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+      }
     });
 
     it('sends only the current question on first contact, with contextual greeting instructions', async () => {

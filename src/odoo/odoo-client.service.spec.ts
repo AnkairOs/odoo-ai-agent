@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { ConfigService } from '@nestjs/config';
 import { OdooClientService } from './odoo-client.service.js';
-import { HttpException, HttpStatus } from '@nestjs/common';
+import { HttpException } from '@nestjs/common';
 
 describe('OdooClientService', () => {
   let service: OdooClientService;
@@ -73,6 +73,7 @@ describe('OdooClientService', () => {
       vi.fn().mockResolvedValue({
         ok: false,
         status: 401,
+        text: async () => JSON.stringify({ error: 'Invalid API Key' }),
         json: async () => ({ error: 'Invalid API Key' }),
       }),
     );
@@ -84,6 +85,46 @@ describe('OdooClientService', () => {
         'search_read',
       ),
     ).rejects.toThrow(HttpException);
+  });
+
+  it('should preserve JSON error details and status', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response('{ "error": "Invalid API Key" }', { status: 401 }),
+      ),
+    );
+
+    const result = await service.testConnection();
+
+    expect(result).toEqual({
+      success: false,
+      database: 'test_db',
+      url: 'http://localhost:8069',
+      error: "Unauthorized Odoo access: check API Key or database permissions for 'test_db'. Details: {\"error\":\"Invalid API Key\"}",
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['<html>Bad Gateway</html>'],
+    ['Upstream unavailable'],
+    [''],
+  ])('should preserve a non-JSON HTTP error body: %j', async (body) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(new Response(body, { status: 502 })),
+    );
+
+    const result = await service.testConnection();
+
+    expect(result).toEqual({
+      success: false,
+      database: 'test_db',
+      url: 'http://localhost:8069',
+      error: `Odoo error (502): ${body}`,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it('should return success true with company details when testConnection succeeds', async () => {

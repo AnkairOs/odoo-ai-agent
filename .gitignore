@@ -34,3 +34,5 @@ logs
 
 # Relay SQLite data
 data/
+# Local AI runtime state
+.atl/
