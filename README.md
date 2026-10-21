@@ -234,6 +234,38 @@ Voy a actualizar «Pioneer 2» (ID 81) en Odoo (catalog):
 
 Archiving performs a soft delete via Odoo JSON-2 `product.product/write` setting `active: false`, with a preview warning that the product will be hidden from sales and searches. Hard delete (`unlink`) is disallowed. Both operations require human confirmation, 15-minute expiry, durable pre-HTTP claims and replay safety.
 
+**Batch operations and conversational chaining (S1–S5).** When mutation is enabled, the operator can perform multi-item operations with a single consolidated preview and one-touch natural confirmation ("sí", "dale", "hazlo", "de una"):
+
+- **Batch creation (`create_products`):** Dictate or paste 2 to 20 products with or without prices, VAT mode or cost. A single preview lists each product with its commercial parameters (`• Nombre – ref: X – precio + IVA – costo`). On approval, Odoo creates all products natively in a single `vals_list` write:
+  ```text
+  Voy a crear estos 2 productos en Odoo (catalog):
+  • Pioneer 2 – ref: DDJ – $39.13 + IVA 15% = $45.00 – costo: $30.00
+  • Sony Alpha – sin ref – $86.96 + IVA 15% = $100.00
+  ¿Los creo? Responde «sí» para crearlos o dime qué cambiar. Vence en 15 minutos.
+  ```
+  Confirmation notice: `¡Listo! Creé los 2 productos en Odoo. ¿Deseas hacer algo más con ellos o buscar en el catálogo?`
+
+- **Batch update (`update_products`):** Modify fields (name, reference, sale price with VAT, cost) for 2 to 20 existing products in a single turn. Current values are fetched from Odoo to render a comparative before ➔ after preview for each modified field:
+  ```text
+  Voy a actualizar estos 2 productos en Odoo (catalog):
+  • ID 81 (Pioneer 2): precio: $26.09 (+ IVA 15% = $30.00) ➔ $34.78 (+ IVA 15% = $40.00)
+  • ID 82 (Sony Alpha): costo: $50.00 ➔ $60.00
+  ¿Los actualizo? Responde «sí» o dime qué cambiar. Vence en 15 minutos.
+  ```
+  On approval, updates are grouped by values to minimize RPC calls. If all succeed: `¡Listo! Actualicé los 2 productos en Odoo. ¿Deseas consultar cómo quedaron o realizar otra modificación?` If any write fails, a partial outcome report details how many succeeded and lists unadjusted IDs: `Actualicé 1 de 2 productos en Odoo. Los productos con ID [82] no se modificaron. Revísalos en Odoo.`
+
+- **Batch archive (`archive_products`):** Archive 2 to 50 existing products by ID (e.g. «Archiva todos los pioneer» or «Archiva los productos 81 y 82»). Previews all targeted products with ID and name, warning they will be hidden from the sales catalog:
+  ```text
+  Voy a archivar estos 2 productos en Odoo (catalog):
+  • ID 81: Pioneer 2 (ref: DDJ)
+  • ID 82: Sony Alpha
+  • Los productos quedarán archivados y ocultos del catálogo de ventas.
+  ¿Los archivo? Responde «sí» para confirmar o «no» para cancelar. Vence en 15 minutos.
+  ```
+  On approval, soft-deletes via `active: false` and confirms: `¡Listo! Archivé los 2 productos en Odoo. Quedaron ocultos del catálogo de ventas. ¿Deseas hacer algo más?`
+
+- **Conversational chaining and friendly guidance (S4):** Upon completing an action, the agent proactively offers next steps (reviewing changes, editing another, archiving or catalog search). When multiple proposals or parallel requests arise, the assistant guides the operator toward batch support rather than rigidly refusing: `Puedo crear, editar o archivar varios productos a la vez con una sola confirmación. Dime los productos y los preparo en lote.` Natural rejections ("no", "cancela") cancel batch proposals cleanly (`Listo, no los creé.`, `Listo, no los actualicé.`, `Listo, no los archivé.`), and 15-minute expiration discards stale proposals automatically.
+
 **Catalog search with prices, overview and pagination (S7).** `search_products` accepts an optional `query` and optional `offset` (integer between 0 and 10,000, default 0, limit 5). When `query` is omitted, empty or whitespace, it returns active saleable products ordered by ID descending (newest first). When provided, it filters by name or reference ordered by name ascending. The tool calls `search_read` with `['id', 'name', 'default_code', 'list_price', 'taxes_id']` and `search_count` for total matching products, returning `{ status: 'ok', products, total, offset }`. This allows the conversational agent to present the general catalog overview with real prices, answer price questions, and paginate through products upon request.
 
 Creation uses native SDK `user-approval`. An approval-only SDK response is a valid proposal, not a failed empty answer. Before any send, SQLite records one immutable action with the exact name/reference, goods-without-tracking type, fixed URL/database/company, call/approval IDs and 15-minute expiry. Only a confirmed private preview delivery enables approval. The deterministic preview warns about Odoo's default commercial values, including the possible default price of 1. Unknown or rejected delivery cannot authorize a write; model prose cannot change the preview's fields.

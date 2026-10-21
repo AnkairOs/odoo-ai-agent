@@ -29,6 +29,31 @@ export const productUpdateSchema = z.object({
 
 export type ProductUpdate = z.infer<typeof productUpdateSchema>;
 
+export const batchArchiveIdsSchema = z
+  .array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER))
+  .min(2)
+  .max(50)
+  .refine((ids) => new Set(ids).size === ids.length, {
+    message: 'Product IDs must be unique',
+  });
+
+export const batchUpdateItemSchema = z
+  .object({
+    id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    input: productUpdateSchema,
+  })
+  .strict();
+
+export const batchProductUpdateSchema = z
+  .array(batchUpdateItemSchema)
+  .min(2)
+  .max(20)
+  .refine((items) => new Set(items.map((item) => item.id)).size === items.length, {
+    message: 'Product IDs must be unique',
+  });
+
+export type BatchUpdateItem = z.infer<typeof batchUpdateItemSchema>;
+
 export type ProductUpdateResult =
   | { status: 'updated' }
   | { status: 'rejected' | 'unknown' | 'unavailable' };
@@ -37,7 +62,30 @@ export type ProductArchiveResult =
   | { status: 'archived' }
   | { status: 'rejected' | 'unknown' | 'unavailable' };
 
+export type ProductBatchArchiveResult =
+  | { status: 'archived'; ids: number[] }
+  | { status: 'rejected' | 'unknown' | 'unavailable' };
+
+export interface ProductBatchUpdateProgress {
+  updatedIds: number[];
+  rejectedIds: number[];
+  unknownIds: number[];
+  notAttemptedIds: number[];
+}
+
+export type ProductBatchUpdateResult =
+  | { status: 'updated'; count: number }
+  | { status: 'unavailable' }
+  | ({ status: 'partial' | 'rejected' | 'unknown' } & ProductBatchUpdateProgress);
+
+type BatchWriteGroup = {
+  ids: number[];
+  vals: Record<string, unknown>;
+  outcome: 'notAttempted' | 'inFlight' | 'updated' | 'rejected' | 'unknown';
+};
+
 const MUTATION_TIMEOUT_MS = 10_000;
+const BATCH_MUTATION_TIMEOUT_MS = 15_000;
 
 @Injectable()
 export class OdooProductUpdateService {
@@ -112,6 +160,68 @@ export class OdooProductUpdateService {
     return { status: result };
   }
 
+  async archiveBatch(
+    ids: number[],
+    expected: ProductDestination,
+  ): Promise<ProductBatchArchiveResult> {
+    const destination = this.destination();
+    const parsed = batchArchiveIdsSchema.safeParse(ids);
+    if (!destination || !sameProductDestination(destination, expected) || !parsed.success) {
+      return { status: 'unavailable' };
+    }
+
+    const apiKey = this.explicitString('ODOO_DEFAULT_API_KEY')!;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<ProductBatchArchiveResult>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve({ status: 'unknown' });
+      }, BATCH_MUTATION_TIMEOUT_MS);
+    });
+
+    try {
+      return await Promise.race([
+        this.archiveBatchOnce(destination, apiKey, parsed.data, controller.signal),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async updateBatch(
+    items: { id: number; input: ProductUpdate }[],
+    expected: ProductDestination,
+  ): Promise<ProductBatchUpdateResult> {
+    const destination = this.destination();
+    const parsed = batchProductUpdateSchema.safeParse(items);
+    if (!destination || !sameProductDestination(destination, expected) || !parsed.success) {
+      return { status: 'unavailable' };
+    }
+
+    const apiKey = this.explicitString('ODOO_DEFAULT_API_KEY')!;
+    const groups: BatchWriteGroup[] = groupUpdateItems(parsed.data)
+      .map((group) => ({ ...group, outcome: 'notAttempted' }));
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<ProductBatchUpdateResult>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve(batchUpdateFailure(groups));
+      }, BATCH_MUTATION_TIMEOUT_MS);
+    });
+
+    try {
+      return await Promise.race([
+        this.executeBatchWrites(destination, apiKey, groups, parsed.data.length, controller.signal),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private async executeTimedWrite(
     target: ProductDestination,
     apiKey: string,
@@ -129,7 +239,7 @@ export class OdooProductUpdateService {
 
     try {
       return await Promise.race([
-        this.writeOnce(target, apiKey, id, vals, controller.signal),
+        this.writeOnce(target, apiKey, [id], vals, controller.signal),
         timeout,
       ]);
     } finally {
@@ -137,10 +247,41 @@ export class OdooProductUpdateService {
     }
   }
 
+  private async archiveBatchOnce(
+    target: ProductDestination,
+    apiKey: string,
+    ids: number[],
+    signal: AbortSignal,
+  ): Promise<ProductBatchArchiveResult> {
+    const result = await this.writeOnce(target, apiKey, ids, { active: false }, signal);
+    if (result === 'ok') {
+      return { status: 'archived', ids };
+    }
+    return { status: result };
+  }
+
+  private async executeBatchWrites(
+    target: ProductDestination,
+    apiKey: string,
+    groups: BatchWriteGroup[],
+    totalCount: number,
+    signal: AbortSignal,
+  ): Promise<ProductBatchUpdateResult> {
+    for (const group of groups) {
+      if (signal.aborted) return batchUpdateFailure(groups);
+      group.outcome = 'inFlight';
+      const result = await this.writeOnce(target, apiKey, group.ids, group.vals, signal);
+      if (signal.aborted) return batchUpdateFailure(groups);
+      group.outcome = result === 'ok' ? 'updated' : result;
+      if (result !== 'ok') return batchUpdateFailure(groups);
+    }
+    return { status: 'updated', count: totalCount };
+  }
+
   private async writeOnce(
     target: ProductDestination,
     apiKey: string,
-    id: number,
+    ids: number[],
     vals: Record<string, unknown>,
     signal: AbortSignal,
   ): Promise<'ok' | 'rejected' | 'unknown'> {
@@ -155,7 +296,7 @@ export class OdooProductUpdateService {
           'X-Odoo-Database': target.db,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ ids: [id], vals }),
+        body: JSON.stringify({ ids, vals }),
       });
 
       if (!response.ok) {
@@ -175,8 +316,39 @@ export class OdooProductUpdateService {
   }
 }
 
-function isValidProductId(id: number): boolean {
-  return Number.isSafeInteger(id) && id > 0;
+function batchUpdateFailure(groups: BatchWriteGroup[]): ProductBatchUpdateResult {
+  const progress: ProductBatchUpdateProgress = {
+    updatedIds: [], rejectedIds: [], unknownIds: [], notAttemptedIds: [],
+  };
+  for (const group of groups) {
+    const key = group.outcome === 'inFlight' ? 'unknownIds' : `${group.outcome}Ids` as const;
+    progress[key].push(...group.ids);
+  }
+  const status = progress.updatedIds.length > 0 ? 'partial'
+    : progress.unknownIds.length > 0 ? 'unknown'
+      : progress.rejectedIds.length > 0 ? 'rejected' : 'unknown';
+  return { status, ...progress };
+}
+
+function groupUpdateItems(
+  items: { id: number; input: ProductUpdate }[],
+): { ids: number[]; vals: Record<string, unknown> }[] {
+  const groups = new Map<string, { ids: number[]; vals: Record<string, unknown> }>();
+  for (const item of items) {
+    const vals = buildUpdateVals(item.input);
+    const key = JSON.stringify(vals);
+    const existing = groups.get(key);
+    if (existing) {
+      existing.ids.push(item.id);
+    } else {
+      groups.set(key, { ids: [item.id], vals });
+    }
+  }
+  return Array.from(groups.values());
+}
+
+function isValidProductId(id: unknown): id is number {
+  return typeof id === 'number' && Number.isSafeInteger(id) && id > 0;
 }
 
 function buildUpdateVals(product: ProductUpdate): Record<string, unknown> {
