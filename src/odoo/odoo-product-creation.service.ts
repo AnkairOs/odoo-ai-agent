@@ -40,6 +40,13 @@ export type ProductCreationResult =
   | { status: 'created'; id: number }
   | { status: 'unknown' | 'rejected' | 'unavailable' };
 
+export const batchProductCreationSchema = z.array(productCreationSchema).min(2).max(20);
+export type ProductBatchCreationResult =
+  | { status: 'created'; ids: number[] }
+  | { status: 'rejected' | 'unknown' | 'unavailable' };
+
+const BATCH_MUTATION_TIMEOUT_MS = 15_000;
+
 @Injectable()
 export class OdooProductCreationService {
   constructor(private readonly config: ConfigService) {}
@@ -81,6 +88,30 @@ export class OdooProductCreationService {
     } finally { clearTimeout(timer); }
   }
 
+  async createBatch(products: ProductCreation[], expected: ProductDestination): Promise<ProductBatchCreationResult> {
+    const destination = this.destination();
+    const parsed = batchProductCreationSchema.safeParse(products);
+    if (!destination || !sameProductDestination(destination, expected) || !parsed.success) {
+      return { status: 'unavailable' };
+    }
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<ProductBatchCreationResult>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve({ status: 'unknown' });
+      }, BATCH_MUTATION_TIMEOUT_MS);
+    });
+    try {
+      return await Promise.race([
+        this.createBatchOnce(parsed.data, destination, controller.signal),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private async createOnce(product: ProductCreation, target: ProductDestination, signal: AbortSignal): Promise<ProductCreationResult> {
     try {
       const response = await fetch(`${target.url.replace(/\/+$/u, '')}/json/2/product.product/create`, {
@@ -95,9 +126,40 @@ export class OdooProductCreationService {
         return { status: [401, 403, 404].includes(response.status) ? 'rejected' : 'unknown' };
       }
       const ids: unknown = await response.json();
-      return Array.isArray(ids) && ids.length === 1 && Number.isSafeInteger(ids[0]) && ids[0] > 0
-        ? { status: 'created', id: ids[0] as number } : { status: 'unknown' };
+      return Array.isArray(ids) && ids.length === 1 && isValidProductId(ids[0])
+        ? { status: 'created', id: ids[0] } : { status: 'unknown' };
     } catch { return { status: 'unknown' }; }
+  }
+
+  private async createBatchOnce(
+    products: ProductCreation[],
+    target: ProductDestination,
+    signal: AbortSignal,
+  ): Promise<ProductBatchCreationResult> {
+    try {
+      const response = await fetch(`${target.url.replace(/\/+$/u, '')}/json/2/product.product/create`, {
+        method: 'POST',
+        redirect: 'error',
+        signal,
+        headers: {
+          Authorization: `Bearer ${this.explicitString('ODOO_DEFAULT_API_KEY')!}`,
+          'X-Odoo-Database': target.db,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          vals_list: products.map((product) => productValues(product, target)),
+        }),
+      });
+      if (!response.ok) {
+        return { status: [401, 403, 404].includes(response.status) ? 'rejected' : 'unknown' };
+      }
+      const ids: unknown = await response.json();
+      return Array.isArray(ids) && ids.length === products.length && ids.every(isValidProductId)
+        ? { status: 'created', ids }
+        : { status: 'unknown' };
+    } catch {
+      return { status: 'unknown' };
+    }
   }
 
   private explicitString(key: string): string | undefined {
@@ -115,6 +177,10 @@ function productValues(product: ProductCreation, target: ProductDestination): Re
     ...(product.standardPrice === undefined ? {} : { standard_price: product.standardPrice }),
     ...(product.taxId === undefined ? {} : { taxes_id: [[6, 0, [product.taxId]]] }),
   };
+}
+
+function isValidProductId(id: unknown): id is number {
+  return typeof id === 'number' && Number.isSafeInteger(id) && id > 0;
 }
 
 export function sameProductDestination(a: ProductDestination, b: ProductDestination): boolean {
