@@ -25,9 +25,55 @@ const conversationPriceSchema = z.object({
 }).strict();
 export type ConversationPrice = z.infer<typeof conversationPriceSchema>;
 
-export interface ConversationAction extends NewProduct, ProductDestination {
-  price?: ConversationPrice;
-  cost?: number;
+const catalogText = /^[\p{L}\p{N}][\p{L}\p{N} ._()+&,'’#-]*$/u;
+
+export const conversationProductIdSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+
+export const updateCurrentValuesSchema = z.object({
+  name: z.string().min(1),
+  reference: z.string().optional(),
+  listPrice: z.number().min(0).optional(),
+  cost: z.number().min(0).optional(),
+  taxId: taxIdSchema.optional(),
+}).strict();
+export type ConversationCurrentValues = z.infer<typeof updateCurrentValuesSchema>;
+
+export const updateProposedValuesSchema = z.object({
+  name: z.string().trim().min(1).max(120).regex(catalogText).optional(),
+  reference: z.string().trim().min(1).max(255).regex(catalogText).optional(),
+  price: conversationPriceSchema.optional(),
+  cost: costSchema.optional(),
+}).strict().refine(
+  (data) => data.name !== undefined || data.reference !== undefined || data.price !== undefined || data.cost !== undefined,
+  { message: 'At least one proposed value must be provided' },
+);
+export type ConversationProposedValues = z.infer<typeof updateProposedValuesSchema>;
+
+export const conversationProductUpdateInputSchema = z.object({
+  productId: conversationProductIdSchema,
+  name: z.string().trim().min(1).max(120).regex(catalogText).optional(),
+  reference: z.string().trim().min(1).max(255).regex(catalogText).optional(),
+  salePrice: salePriceSchema.optional(),
+  priceIncludesTax: z.boolean().optional(),
+  taxId: taxIdSchema.optional(),
+  cost: costSchema.optional(),
+}).strict().refine(
+  (data) =>
+    data.name !== undefined ||
+    data.reference !== undefined ||
+    data.salePrice !== undefined ||
+    data.cost !== undefined ||
+    data.taxId !== undefined,
+  { message: 'At least one field must be provided' },
+);
+export type ConversationProductUpdateInput = z.infer<typeof conversationProductUpdateInputSchema>;
+
+export const conversationProductArchiveInputSchema = z.object({
+  productId: conversationProductIdSchema,
+}).strict();
+export type ConversationProductArchiveInput = z.infer<typeof conversationProductArchiveInputSchema>;
+
+interface ConversationActionBase extends ProductDestination {
   id: string;
   approvalId: string;
   authorityFingerprint: string;
@@ -38,6 +84,36 @@ export interface ConversationAction extends NewProduct, ProductDestination {
   productId?: number;
 }
 
+export interface ConversationCreateAction extends ConversationActionBase, NewProduct {
+  kind?: 'create';
+  price?: ConversationPrice;
+  cost?: number;
+}
+
+export interface ConversationUpdateAction extends ConversationActionBase {
+  kind: 'update';
+  productId: number;
+  currentValues: ConversationCurrentValues;
+  proposedValues: ConversationProposedValues;
+}
+
+export interface ConversationArchiveAction extends ConversationActionBase {
+  kind: 'archive';
+  productId: number;
+  name: string;
+  reference?: string;
+}
+
+export type ConversationAction =
+  | ConversationCreateAction
+  | ConversationUpdateAction
+  | ConversationArchiveAction;
+
+export type ConversationActionProposal =
+  | (Omit<ConversationCreateAction, 'status' | 'visibleMessageId' | 'productId'> & { kind?: 'create'; productId?: number })
+  | (Omit<ConversationUpdateAction, 'status' | 'visibleMessageId'> & { kind: 'update' })
+  | (Omit<ConversationArchiveAction, 'status' | 'visibleMessageId'> & { kind: 'archive' });
+
 export interface OperatorConversation {
   messages: ModelMessage[];
   action?: ConversationAction;
@@ -47,17 +123,36 @@ export interface OperatorConversation {
 export const MAX_CONVERSATION_MESSAGES = 40;
 export const MAX_CONVERSATION_BYTES = 64_000;
 
-function hasApprovalChain(messages: ModelMessage[], approvalId: string, toolCallId: string): boolean {
+const APPROVAL_TOOLS = ['create_product', 'update_product', 'archive_product'] as const;
+
+function hasApprovalChain(messages: ModelMessage[], approvalId: string, toolCallId: string, toolName?: string): boolean {
+  const allowed = toolName ? [toolName] : APPROVAL_TOOLS;
   return messages.some((message) => message.role === 'assistant' && Array.isArray(message.content) &&
     message.content.some((part) => part.type === 'tool-approval-request' && part.approvalId === approvalId &&
       part.toolCallId === toolCallId) && message.content.some((part) => part.type === 'tool-call' &&
-        part.toolCallId === toolCallId && part.toolName === 'create_product'));
+        part.toolCallId === toolCallId && typeof part.toolName === 'string' && (allowed as readonly string[]).includes(part.toolName)));
 }
 
-function matchesRequest(action: ConversationAction, input: ConversationProduct): boolean {
+function matchesRequest(action: ConversationCreateAction, input: ConversationProduct): boolean {
   return action.name === input.name && action.reference === input.reference &&
     action.price?.amount === input.salePrice && action.price?.includesTax === input.priceIncludesTax &&
     action.price?.requestedTaxId === input.taxId && action.cost === input.cost;
+}
+
+function matchesUpdateRequest(action: ConversationUpdateAction, input: ConversationProductUpdateInput): boolean {
+  if (action.productId !== input.productId) return false;
+  const proposed = action.proposedValues;
+  if (proposed.name !== input.name) return false;
+  if (proposed.reference !== input.reference) return false;
+  if (proposed.cost !== input.cost) return false;
+  if (proposed.price) {
+    if (proposed.price.amount !== input.salePrice) return false;
+    if (proposed.price.includesTax !== input.priceIncludesTax) return false;
+    if (proposed.price.requestedTaxId !== input.taxId) return false;
+  } else {
+    if (input.salePrice !== undefined || input.priceIncludesTax !== undefined || input.taxId !== undefined) return false;
+  }
+  return true;
 }
 
 export function boundConversation(messages: ModelMessage[]): ModelMessage[] | undefined {
@@ -298,19 +393,66 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
   }
 
   reserveConversationAction(operator: string, businessPhone: string, eventId: string,
-    action: Omit<ConversationAction, 'status' | 'visibleMessageId' | 'productId'>, messages: ModelMessage[]): boolean {
+    action: ConversationActionProposal, messages: ModelMessage[]): boolean {
     const state = this.getOperatorConversation(operator, businessPhone);
+    if (state.busy !== eventId ||
+      (state.action && !['created', 'cancelled', 'rejected'].includes(state.action.status))) return false;
+    const bounded = boundConversation(messages);
+    if (!bounded) return false;
+
+    if (action.kind === 'update') {
+      const idParsed = conversationProductIdSchema.safeParse(action.productId);
+      const current = updateCurrentValuesSchema.safeParse(action.currentValues);
+      const proposed = updateProposedValuesSchema.safeParse(action.proposedValues);
+      if (!idParsed.success || !current.success || !proposed.success ||
+        !hasApprovalChain(bounded, action.approvalId, action.toolCallId, 'update_product')) return false;
+      const stored: ConversationUpdateAction = {
+        ...action,
+        kind: 'update',
+        productId: idParsed.data,
+        currentValues: current.data,
+        proposedValues: proposed.data,
+        status: 'proposed',
+      };
+      return this.db.prepare(`UPDATE operator_conversations SET action = ?, messages = ?
+        WHERE operator = ? AND business_phone = ? AND busy = ?`).run(
+          JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
+    }
+
+    if (action.kind === 'archive') {
+      const idParsed = conversationProductIdSchema.safeParse(action.productId);
+      const nameParsed = z.string().min(1).safeParse(action.name);
+      const refParsed = z.string().optional().safeParse(action.reference);
+      if (!idParsed.success || !nameParsed.success || !refParsed.success ||
+        !hasApprovalChain(bounded, action.approvalId, action.toolCallId, 'archive_product')) return false;
+      const stored: ConversationArchiveAction = {
+        ...action,
+        kind: 'archive',
+        productId: idParsed.data,
+        name: nameParsed.data,
+        ...(action.reference !== undefined ? { reference: action.reference } : {}),
+        status: 'proposed',
+      };
+      return this.db.prepare(`UPDATE operator_conversations SET action = ?, messages = ?
+        WHERE operator = ? AND business_phone = ? AND busy = ?`).run(
+          JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
+    }
+
     const product = newProductSchema.safeParse({ name: action.name,
       ...(action.reference === undefined ? {} : { reference: action.reference }) });
     const price = conversationPriceSchema.optional().safeParse(action.price);
     const cost = costSchema.optional().safeParse(action.cost);
-    const bounded = boundConversation(messages);
-    if (state.busy !== eventId || !product.success || !price.success || !cost.success || !bounded ||
-      !hasApprovalChain(bounded, action.approvalId, action.toolCallId) ||
-      (state.action && !['created', 'cancelled', 'rejected'].includes(state.action.status))) return false;
+    if (!product.success || !price.success || !cost.success ||
+      !hasApprovalChain(bounded, action.approvalId, action.toolCallId, 'create_product')) return false;
+    const stored: ConversationCreateAction = {
+      ...action,
+      kind: 'create',
+      ...product.data,
+      status: 'proposed',
+    };
     return this.db.prepare(`UPDATE operator_conversations SET action = ?, messages = ?
       WHERE operator = ? AND business_phone = ? AND busy = ?`).run(
-        JSON.stringify({ ...action, ...product.data, status: 'proposed' }), JSON.stringify(bounded),
+        JSON.stringify(stored), JSON.stringify(bounded),
         operator, businessPhone, eventId).changes === 1;
   }
 
@@ -334,16 +476,61 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
   claimConversationCreation(operator: string, businessPhone: string, eventId: string, actionId: string,
     toolCallId: string, input: ConversationProduct, target: ProductDestination, timestamp: number): boolean {
     return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
-      conversationProductSchema.safeParse(input).success && action.status === 'approved' && action.visibleMessageId && action.expiresAt > timestamp &&
-        action.toolCallId === toolCallId && matchesRequest(action, input) &&
-        sameProductDestination(action, target) ? { ...action, status: 'creating' } : undefined);
+      conversationProductSchema.safeParse(input).success &&
+      (action.kind === undefined || action.kind === 'create') &&
+      action.status === 'approved' && action.visibleMessageId && action.expiresAt > timestamp &&
+      action.toolCallId === toolCallId && matchesRequest(action, input) &&
+      sameProductDestination(action, target) ? { ...action, status: 'creating' } : undefined);
+  }
+
+  claimConversationUpdate(operator: string, businessPhone: string, eventId: string, actionId: string,
+    toolCallId: string, input: ConversationProductUpdateInput, target: ProductDestination, timestamp: number): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
+      conversationProductUpdateInputSchema.safeParse(input).success &&
+      action.kind === 'update' &&
+      action.status === 'approved' && action.visibleMessageId && action.expiresAt > timestamp &&
+      action.toolCallId === toolCallId && matchesUpdateRequest(action, input) &&
+      sameProductDestination(action, target) ? { ...action, status: 'creating' } : undefined);
+  }
+
+  claimConversationArchive(operator: string, businessPhone: string, eventId: string, actionId: string,
+    toolCallId: string, input: ConversationProductArchiveInput, target: ProductDestination, timestamp: number): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
+      conversationProductArchiveInputSchema.safeParse(input).success &&
+      action.kind === 'archive' &&
+      action.status === 'approved' && action.visibleMessageId && action.expiresAt > timestamp &&
+      action.toolCallId === toolCallId && action.productId === input.productId &&
+      sameProductDestination(action, target) ? { ...action, status: 'creating' } : undefined);
+  }
+
+  finishConversationAction(operator: string, businessPhone: string, eventId: string, actionId: string,
+    status: 'created' | 'rejected' | 'unknown', productId?: number): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) => {
+      if (action.status !== 'creating') return undefined;
+      if (status === 'created') {
+        if (action.kind === 'update' || action.kind === 'archive') {
+          return { ...action, status };
+        }
+        if (!Number.isSafeInteger(productId) || productId! <= 0) return undefined;
+        return { ...action, status, productId };
+      }
+      return { ...action, status };
+    });
   }
 
   finishConversationCreation(operator: string, businessPhone: string, eventId: string, actionId: string,
     status: 'created' | 'rejected' | 'unknown', productId?: number): boolean {
-    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
-      action.status === 'creating' && (status !== 'created' || (Number.isSafeInteger(productId) && productId! > 0))
-        ? { ...action, status, ...(status === 'created' ? { productId } : {}) } : undefined);
+    return this.finishConversationAction(operator, businessPhone, eventId, actionId, status, productId);
+  }
+
+  finishConversationUpdate(operator: string, businessPhone: string, eventId: string, actionId: string,
+    status: 'created' | 'rejected' | 'unknown'): boolean {
+    return this.finishConversationAction(operator, businessPhone, eventId, actionId, status);
+  }
+
+  finishConversationArchive(operator: string, businessPhone: string, eventId: string, actionId: string,
+    status: 'created' | 'rejected' | 'unknown'): boolean {
+    return this.finishConversationAction(operator, businessPhone, eventId, actionId, status);
   }
 
   private updateConversationAction(operator: string, businessPhone: string, eventId: string, actionId: string,

@@ -196,9 +196,9 @@ Quiero crear Pioneer 2, referencia DDJ
 Sí
 ```
 
-The Vercel SDK chooses whether to answer, ask for missing information or call tools, with at most four generation steps per turn. Capability instructions come from the actual server registry: `search_products` exists only with explicit lookup settings; `create_product` and the read-only `list_sales_taxes` exist only when the creation opt-in and fixed destination are valid. These are the only Odoo operations in this conversation. A name is required and a reference is optional. There is no keyword-intent router or new agent engine.
+The Vercel SDK chooses whether to answer, ask for missing information or call tools, with at most four generation steps per turn. Capability instructions come from the actual server registry: `search_products` exists only with explicit lookup settings; `create_product`, `update_product`, `archive_product` and the read-only `list_sales_taxes` exist only when the mutation opt-in and fixed destination are valid. These are the only Odoo operations in this conversation. A name is required and a reference is optional. There is no keyword-intent router or new agent engine.
 
-Replies are written for WhatsApp: 1–3 plain-text sentences, greeting only when the operator greets or on the first message, no repeated capability lists, no tool names or technical codes, and no offers to edit, price, stock, image or delete products. Before sending, model text is normalized deterministically: `**bold**` becomes `*bold*`, heading markers are stripped and Markdown tables become `• ` lines (header and separator dropped, cells joined with ` – `). Deterministic notices are sent verbatim. The private preview looks like:
+Replies are written for WhatsApp: 1–3 plain-text sentences, greeting only when the operator greets or on the first message, no repeated capability lists, no tool names or technical codes, and no offers to change stock, images or permanently delete products. Before sending, model text is normalized deterministically: `**bold**` becomes `*bold*`, heading markers are stripped and Markdown tables become `• ` lines (header and separator dropped, cells joined with ` – `). Deterministic notices are sent verbatim. The private preview looks like:
 
 ```text
 Voy a crear este producto en Odoo (catalog):
@@ -222,6 +222,19 @@ Voy a crear este producto en Odoo (catalog):
 ```
 
 The total is computed from the stored base. Without a price the default-price warning stays; without a cost there is no cost line. The write adds `list_price`, `standard_price` and `taxes_id: [[6, 0, [taxId]]]` (the resolved tax, also when it is the company default) only when present. Any price, VAT or cost change needs a new preview and approval. Before the write the server re-reads the active sale taxes; if the stored tax is gone or its name/rate/base differs, the action is consumed as rejected without HTTP. Assumes a company configured with tax-excluded prices and a `$` currency; the dedicated account's permission to write cost has not been verified live.
+
+**Updating and archiving products (S1–S5).** When mutation is enabled, the operator can update fields (name, reference, sale price with VAT, cost) or archive existing products by ID. The system reads current values from Odoo before proposing. Updating generates a comparative before-and-after preview for modified fields:
+
+```text
+Voy a actualizar «Pioneer 2» (ID 81) en Odoo (catalog):
+• Nombre: Pioneer 2 ➔ Pioneer 3
+• Precio: $26.09 (+ IVA 15% = $30.00) ➔ $34.78 (+ IVA 15% = $40.00)
+¿Lo actualizo? Responde «sí» o dime qué cambiar. Vence en 15 minutos.
+```
+
+Archiving performs a soft delete via Odoo JSON-2 `product.product/write` setting `active: false`, with a preview warning that the product will be hidden from sales and searches. Hard delete (`unlink`) is disallowed. Both operations require human confirmation, 15-minute expiry, durable pre-HTTP claims and replay safety.
+
+**Catalog search with prices, overview and pagination (S7).** `search_products` accepts an optional `query` and optional `offset` (integer between 0 and 10,000, default 0, limit 5). When `query` is omitted, empty or whitespace, it returns active saleable products ordered by ID descending (newest first). When provided, it filters by name or reference ordered by name ascending. The tool calls `search_read` with `['id', 'name', 'default_code', 'list_price', 'taxes_id']` and `search_count` for total matching products, returning `{ status: 'ok', products, total, offset }`. This allows the conversational agent to present the general catalog overview with real prices, answer price questions, and paginate through products upon request.
 
 Creation uses native SDK `user-approval`. An approval-only SDK response is a valid proposal, not a failed empty answer. Before any send, SQLite records one immutable action with the exact name/reference, goods-without-tracking type, fixed URL/database/company, call/approval IDs and 15-minute expiry. Only a confirmed private preview delivery enables approval. The deterministic preview warns about Odoo's default commercial values, including the possible default price of 1. Unknown or rejected delivery cannot authorize a write; model prose cannot change the preview's fields.
 
