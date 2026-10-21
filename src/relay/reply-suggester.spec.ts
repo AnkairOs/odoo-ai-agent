@@ -24,7 +24,14 @@ describe('ReplySuggester product lookup', () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it.each(['suggest', 'revise'] as const)('offers fixed lookup during %s without changing history messages', async (mode) => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response('[{"id":1,"name":"Cable","default_code":"CB1"}]'));
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.endsWith('/search_read')) {
+        return new Response(JSON.stringify([{ id: 1, name: 'Cable', default_code: 'CB1', list_price: 25, taxes_id: [1] }]));
+      }
+      if (u.endsWith('/search_count')) return new Response('1');
+      return new Response('not found', { status: 404 });
+    });
     vi.stubGlobal('fetch', fetchMock);
     const config = new ConfigService({ ODOO_DEFAULT_URL: 'https://odoo.example.invalid', ODOO_DEFAULT_DB: 'business', ODOO_DEFAULT_API_KEY: 'mock-key' });
     const service = new OdooProductsService(new OdooClientService(config), config);
@@ -42,7 +49,12 @@ describe('ReplySuggester product lookup', () => {
         expect(schema.safeParse(input).success).toBe(false);
       }
       expect(schema.safeParse({ query: 'x'.repeat(120) }).success).toBe(true);
-      expect(await lookup(request, { query: 'Cable' })).toEqual({ status: 'ok', products: [{ id: 1, name: 'Cable', default_code: 'CB1' }] });
+      expect(await lookup(request, { query: 'Cable' })).toEqual({
+        status: 'ok',
+        products: [{ id: 1, name: 'Cable', default_code: 'CB1', list_price: 25, taxes_id: [1] }],
+        total: 1,
+        offset: 0,
+      });
       expect(request.messages).toEqual([
         { role: 'user', content: 'Anterior' }, { role: 'assistant', content: 'Respuesta' },
         { role: 'user', content: mode === 'suggest' ? 'Cable' : JSON.stringify({ question: 'Cable', quotedDraft: 'Borrador', instruction: 'Busca Cable' }) },
@@ -53,7 +65,7 @@ describe('ReplySuggester product lookup', () => {
     const suggester = new ReplySuggester({ isEnabled: () => true, generateWithTools } as unknown as AiService, store as unknown as RelayStore, service);
     expect(await (mode === 'suggest' ? suggester.suggest(2, 'customer') : suggester.revise(2, 'customer', 'Borrador', 'Busca Cable'))).toBe('Déjame confirmar.');
     expect(store.customerHistory).toHaveBeenCalledWith('customer', 2);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it.each(['suggest', 'revise'] as const)('keeps %s usable when lookup fails or is unconfigured', async (mode) => {
@@ -73,12 +85,12 @@ describe('ReplySuggester product lookup', () => {
     }
   });
 
-  it.each(['suggest', 'revise'] as const)('tells %s to name matching products and ask which one without price or stock', async (mode) => {
+  it.each(['suggest', 'revise'] as const)('tells %s to name matching products and include list_price if requested', async (mode) => {
     const generateWithTools = vi.fn(async (_request: ToolLoopRequest) => draft);
     const suggester = new ReplySuggester({ isEnabled: () => true, generateWithTools } as unknown as AiService, { getQuestion: () => 'Radio', customerHistory: () => [] } as unknown as RelayStore, { search: vi.fn() } as unknown as OdooProductsService);
     await (mode === 'suggest' ? suggester.suggest(1, 'customer') : suggester.revise(1, 'customer', undefined, 'Responde'));
     expect(generateWithTools).toHaveBeenCalledOnce();
-    expect(generateWithTools.mock.calls[0][0].system).toContain('When search_odoo_products returns matching products, name them in the draft (at most five) and ask the customer which one they mean. Do not state or imply price or stock for them.');
+    expect(generateWithTools.mock.calls[0][0].system).toContain('When search_odoo_products returns matching products, name them in the draft (at most five). If the customer asked for prices, you may state the price from list_price. Never invent prices or discounts not returned by Odoo.');
   });
 
   it('never invokes AI or lookup with AI disabled', async () => {

@@ -10,6 +10,7 @@ import { MockLanguageModelV4 } from 'ai/test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AiService } from '../ai/ai.service.js';
 import { OdooProductCreationService } from '../odoo/odoo-product-creation.service.js';
+import { OdooProductUpdateService } from '../odoo/odoo-product-update.service.js';
 import { OdooProductsService } from '../odoo/odoo-products.service.js';
 import { OdooClientService } from '../odoo/odoo-client.service.js';
 import { OdooTaxesService } from '../odoo/odoo-taxes.service.js';
@@ -62,10 +63,11 @@ function setup(results: (Result | Error)[], overrides: Record<string, string> = 
     return { kind: 'sent', messageId: `out-${sent.length}` };
   });
   const creation = new OdooProductCreationService(config);
+  const updateService = new OdooProductUpdateService(config);
   const client = new OdooClientService(config);
   const products = new OdooProductsService(client, config);
   const taxes = new OdooTaxesService(client, config);
-  const service = new OperatorConversationService(config, store, ai, products, creation, taxes, { sendText });
+  const service = new OperatorConversationService(config, store, ai, products, creation, updateService, taxes, { sendText });
   const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response('[81]', { status: 200 }));
   vi.stubGlobal('fetch', fetchMock);
   let event = 0;
@@ -78,14 +80,34 @@ function setup(results: (Result | Error)[], overrides: Record<string, string> = 
 }
 
 function routeOdoo(h: ReturnType<typeof setup>) {
-  const route = { taxes: SALE_TAXES, taxStatus: 200 };
+  const route = {
+    taxes: SALE_TAXES,
+    taxStatus: 200,
+    product: {
+      id: 81,
+      name: 'Pioneer 2',
+      default_code: 'DDJ',
+      list_price: 26.09,
+      standard_price: 20,
+      taxes_id: [1],
+      active: true,
+    } as unknown,
+    productStatus: 200,
+  };
   h.fetchMock.mockImplementation(async (url) => {
     const path = String(url);
     if (path.endsWith('/account.tax/search_read')) return new Response(JSON.stringify(route.taxes), { status: route.taxStatus });
     if (path.endsWith('/res.company/read')) return new Response('[{"id":7,"account_sale_tax_id":[1,"VAT 15% G"]}]');
+    if (path.endsWith('/product.product/read')) return new Response(JSON.stringify(route.product ? [route.product] : []), { status: route.productStatus });
+    if (path.endsWith('/product.product/write')) return new Response('true', { status: 200 });
     return new Response('[81]');
   });
   return route;
+}
+
+function writes(h: ReturnType<typeof setup>) {
+  return h.fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/product.product/write'))
+    .map(([, init]) => JSON.parse(String(init?.body)) as unknown);
 }
 
 function creates(h: ReturnType<typeof setup>) {
@@ -141,7 +163,7 @@ describe('private operator conversation through the real SDK', () => {
     expect(h.state().messages).toEqual([{ role: 'user', content: 'Hola, ¿qué puedes hacer?' },
       { role: 'assistant', content: [{ type: 'text', text: h.sent[0].body }] }]);
     const tools = h.model.doGenerateCalls[0].tools;
-    expect(tools?.map((tool) => tool.name)).toEqual(['search_products', 'list_sales_taxes', 'create_product']);
+    expect(tools?.map((tool) => tool.name)).toEqual(['search_products', 'list_sales_taxes', 'create_product', 'update_product', 'archive_product']);
     expect(h.model.doGenerateCalls[0].prompt[0]).toMatchObject({ role: 'system', content: expect.stringContaining('search_products:') });
   });
 
@@ -155,7 +177,14 @@ describe('private operator conversation through the real SDK', () => {
 
   it('uses SDK search loops and retains full tool messages for follow-ups', async () => {
     const h = setup([call('search_products', { query: 'Pioneer' }, 'search-1'), text('Encontré Pioneer.'), text('La referencia es DDJ.')]);
-    h.fetchMock.mockResolvedValue(new Response(JSON.stringify([{ id: 8, name: 'Pioneer', default_code: 'DDJ' }]), { status: 200 }));
+    h.fetchMock.mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.endsWith('/search_read')) {
+        return new Response(JSON.stringify([{ id: 8, name: 'Pioneer', default_code: 'DDJ', list_price: 100, taxes_id: [] }]), { status: 200 });
+      }
+      if (u.endsWith('/search_count')) return new Response('1', { status: 200 });
+      return new Response('not found', { status: 404 });
+    });
     await h.say('Busca Pioneer');
     const first = h.state().messages;
     expect(first.map((message) => message.role)).toEqual(['user', 'assistant', 'tool', 'assistant']);
@@ -164,8 +193,88 @@ describe('private operator conversation through the real SDK', () => {
     await h.say('¿Cuál es su referencia?');
     expect(JSON.stringify(h.model.doGenerateCalls[2].prompt)).toContain('DDJ');
     expect(h.state().messages.slice(0, first.length)).toEqual(first);
-    expect(h.fetchMock).toHaveBeenCalledTimes(1);
+    expect(h.fetchMock).toHaveBeenCalledTimes(2);
     expect(h.sent.map((message) => message.body)).toEqual(['Encontré Pioneer.', 'La referencia es DDJ.']);
+  });
+
+  it('supports open catalog search without query and mentions total products and prices', async () => {
+    const h = setup([
+      call('search_products', {}, 'catalog-1'),
+      text('Tenemos 12 productos en total. Los más recientes son:\n• Cable – $15.00\n• Pioneer DDJ – $450.00'),
+    ]);
+    h.fetchMock.mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.endsWith('/search_read')) {
+        return new Response(JSON.stringify([
+          { id: 10, name: 'Cable', default_code: null, list_price: 15, taxes_id: [1] },
+          { id: 9, name: 'Pioneer DDJ', default_code: 'DDJ', list_price: 450, taxes_id: [1] },
+        ]), { status: 200 });
+      }
+      if (u.endsWith('/search_count')) return new Response('12', { status: 200 });
+      return new Response('not found', { status: 404 });
+    });
+    await h.say('¿Qué productos hay en el catálogo?');
+    expect(h.sent).toEqual([{
+      to: 'operator',
+      body: 'Tenemos 12 productos en total. Los más recientes son:\n• Cable – $15.00\n• Pioneer DDJ – $450.00',
+    }]);
+    const prompt = h.model.doGenerateCalls[0].prompt[0];
+    expect(prompt).toMatchObject({
+      role: 'system',
+      content: expect.stringContaining('Si el operador pregunta qué productos hay o pide ver el catálogo general'),
+    });
+  });
+
+  it('supports pagination with offset to view more products', async () => {
+    const h = setup([
+      call('search_products', { offset: 5 }, 'page-2'),
+      text('Siguientes productos:\n• Auriculares – $80.00\n• Micrófono – $120.00'),
+    ]);
+    h.fetchMock.mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.endsWith('/search_read')) {
+        return new Response(JSON.stringify([
+          { id: 8, name: 'Auriculares', default_code: 'AUR-1', list_price: 80, taxes_id: [1] },
+          { id: 7, name: 'Micrófono', default_code: 'MIC-1', list_price: 120, taxes_id: [1] },
+        ]), { status: 200 });
+      }
+      if (u.endsWith('/search_count')) return new Response('12', { status: 200 });
+      return new Response('not found', { status: 404 });
+    });
+    await h.say('Muéstrame más productos');
+    expect(h.sent).toEqual([{
+      to: 'operator',
+      body: 'Siguientes productos:\n• Auriculares – $80.00\n• Micrófono – $120.00',
+    }]);
+    const prompt = h.model.doGenerateCalls[0].prompt[0];
+    expect(prompt).toMatchObject({
+      role: 'system',
+      content: expect.stringContaining('Si el operador pide ver más o siguientes productos'),
+    });
+  });
+
+  it('answers price consultation using list_price from search results', async () => {
+    const h = setup([
+      call('search_products', { query: 'Pioneer' }, 'price-check'),
+      text('El Pioneer cuesta $450.00.'),
+    ]);
+    h.fetchMock.mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.endsWith('/search_read')) {
+        return new Response(JSON.stringify([
+          { id: 8, name: 'Pioneer', default_code: 'DDJ', list_price: 450, taxes_id: [1] },
+        ]), { status: 200 });
+      }
+      if (u.endsWith('/search_count')) return new Response('1', { status: 200 });
+      return new Response('not found', { status: 404 });
+    });
+    await h.say('¿Cuánto cuesta el Pioneer?');
+    expect(h.sent).toEqual([{ to: 'operator', body: 'El Pioneer cuesta $450.00.' }]);
+    const prompt = h.model.doGenerateCalls[0].prompt[0];
+    expect(prompt).toMatchObject({
+      role: 'system',
+      content: expect.stringContaining('Si el operador pregunta precios de los productos encontrados'),
+    });
   });
 
   it('asks for the missing name without mutation or a pending proposal', async () => {
@@ -299,11 +408,19 @@ describe('private operator conversation through the real SDK', () => {
     expect(h.sent.at(-1)).toEqual({ to: 'operator', body: 'Hola, podemos seguir conversando.' });
     expect(JSON.stringify(h.model.doGenerateCalls[1].prompt)).not.toContain('Sí, créalo');
     expect(create).not.toHaveBeenCalled();
-    h.fetchMock.mockResolvedValueOnce(new Response(JSON.stringify([{ id: 8, name: 'Pioneer', default_code: 'DDJ' }]), { status: 200 }));
+    h.fetchMock.mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.endsWith('/search_read')) {
+        return new Response(JSON.stringify([{ id: 8, name: 'Pioneer', default_code: 'DDJ', list_price: 100, taxes_id: [] }]), { status: 200 });
+      }
+      if (u.endsWith('/search_count')) return new Response('1', { status: 200 });
+      if (u.endsWith('/product.product/create')) return new Response(JSON.stringify([81]), { status: 200 });
+      return new Response('not found', { status: 404 });
+    });
     await h.say('Busca Pioneer');
     expect(h.sent.at(-1)).toEqual({ to: 'operator', body: 'Encontré Pioneer.' });
-    expect(search).toHaveBeenCalledExactlyOnceWith('Pioneer');
-    expect(h.fetchMock).toHaveBeenCalledTimes(1);
+    expect(search).toHaveBeenCalledExactlyOnceWith({ query: 'Pioneer' });
+    expect(h.fetchMock).toHaveBeenCalledTimes(2);
     await h.say('Ahora propón Pioneer 3');
     expect(h.state().action).toMatchObject({ status: 'pending', name: 'Pioneer 3', toolCallId: 'create-after-expiry' });
     expect(h.state().action?.id).not.toBe(pending.id);
@@ -312,12 +429,12 @@ describe('private operator conversation through the real SDK', () => {
     expect(h.sent.at(-1)?.body).toContain('Nombre: Pioneer 3');
     expect(classify).not.toHaveBeenCalled();
     expect(create).not.toHaveBeenCalled();
-    expect(h.fetchMock).toHaveBeenCalledTimes(1);
+    expect(h.fetchMock).toHaveBeenCalledTimes(2);
     await h.say('Sí, crea Pioneer 3', { id: 'fresh-new-consent' });
     await h.say('Sí, crea Pioneer 3', { id: 'fresh-new-consent' });
     expect(classify).toHaveBeenCalledTimes(1);
     expect(create).toHaveBeenCalledExactlyOnceWith({ name: 'Pioneer 3' }, target);
-    expect(h.fetchMock).toHaveBeenCalledTimes(2);
+    expect(h.fetchMock).toHaveBeenCalledTimes(3);
     expect(h.state().action).toMatchObject({ name: 'Pioneer 3', status: 'created', productId: 81 });
     expect(h.sent.at(-1)).toEqual({ to: 'operator', body: createdNotice.replace('Pioneer 2', 'Pioneer 3') });
     expect(h.store.findProductPreview('existing-created')).toEqual(recorded);
@@ -702,6 +819,183 @@ describe('priced product creation in the operator conversation', () => {
     expect(h.sent).toEqual([{ to: 'operator', body: 'Hay IVA 15% y 0%.' }]);
     const tool = h.model.doGenerateCalls[0].tools?.find((candidate) => candidate.name === 'list_sales_taxes');
     expect(tool).toMatchObject({ inputSchema: { additionalProperties: false, properties: {} } });
+  });
+
+  it('previews product update with comparative before ➔ after and writes on approve', async () => {
+    const h = setup([
+      call('update_product', { productId: 81, name: 'Pioneer 3', salePrice: 40, priceIncludesTax: true }),
+      decision('approve'),
+      text('Listo'),
+    ]);
+    routeOdoo(h);
+    await h.say('Actualiza el precio de Pioneer 2 a $40 con IVA incluido y cámbiale el nombre a Pioneer 3');
+    const updatePreview = [
+      'Voy a actualizar «Pioneer 2» (ID 81) en Odoo (catalog):',
+      '• Nombre: Pioneer 2 ➔ Pioneer 3',
+      '• Precio: $26.09 (+ IVA 15% = $30.00) ➔ $34.78 (+ IVA 15% = $40.00)',
+      '¿Lo actualizo? Responde «sí» o dime qué cambiar. Vence en 15 minutos.',
+    ].join('\n');
+    expect(h.sent[0].body).toBe(updatePreview);
+    expect(writes(h)).toEqual([]);
+    expect(h.state().action).toMatchObject({
+      kind: 'update',
+      productId: 81,
+      status: 'pending',
+    });
+
+    await h.say('Sí, actualízalo');
+    expect(writes(h)).toEqual([{
+      ids: [81],
+      vals: {
+        name: 'Pioneer 3',
+        list_price: 34.78,
+        taxes_id: [[6, 0, [1]]],
+      },
+    }]);
+    expect(h.sent[1].body).toBe('Listo ✅ Actualicé «Pioneer 3» en Odoo (ID 81).');
+    expect(h.state().action?.status).toBe('created');
+  });
+
+  it('previews product archive and soft-deletes via active: false on approve', async () => {
+    const h = setup([
+      call('archive_product', { productId: 81 }),
+      decision('approve'),
+      text('Listo'),
+    ]);
+    routeOdoo(h);
+    await h.say('Archiva el producto 81');
+    const archivePreview = [
+      'Voy a archivar este producto en Odoo (catalog):',
+      '• Nombre: Pioneer 2 (ID 81)',
+      '• Referencia: DDJ',
+      '• El producto quedará archivado y oculto de ventas y búsquedas de catálogo.',
+      '¿Lo archivo? Responde «sí» para confirmar o «no» para cancelar. Vence en 15 minutos.',
+    ].join('\n');
+    expect(h.sent[0].body).toBe(archivePreview);
+    expect(writes(h)).toEqual([]);
+    expect(h.state().action).toMatchObject({
+      kind: 'archive',
+      productId: 81,
+      status: 'pending',
+    });
+
+    await h.say('si achvar esta bien');
+    expect(writes(h)).toEqual([{
+      ids: [81],
+      vals: { active: false },
+    }]);
+    expect(h.sent[1].body).toBe('Listo ✅ Archivé «Pioneer 2» en Odoo (ID 81).');
+    expect(h.state().action?.status).toBe('created');
+  });
+
+  it('handles update and archive rejection by cancelling action and notifying operator', async () => {
+    const hUpdate = setup([
+      call('update_product', { productId: 81, name: 'Pioneer 3' }),
+      decision('reject'),
+      text('Cancelado'),
+    ]);
+    routeOdoo(hUpdate);
+    await hUpdate.say('Actualiza Pioneer 2');
+    await hUpdate.say('No, mejor no');
+    expect(writes(hUpdate)).toEqual([]);
+    expect(hUpdate.state().action?.status).toBe('cancelled');
+    expect(hUpdate.sent[1].body).toBe('Listo, no lo actualicé.');
+
+    const hArchive = setup([
+      call('archive_product', { productId: 81 }),
+      decision('reject'),
+      text('Cancelado'),
+    ]);
+    routeOdoo(hArchive);
+    await hArchive.say('Archiva Pioneer 2');
+    await hArchive.say('Cancela');
+    expect(writes(hArchive)).toEqual([]);
+    expect(hArchive.state().action?.status).toBe('cancelled');
+    expect(hArchive.sent[1].body).toBe('Listo, no lo archivé.');
+  });
+
+  it('prompts clarify questions according to update and archive action kinds', async () => {
+    const hUpdate = setup([
+      call('update_product', { productId: 81, name: 'Pioneer 3' }),
+      decision('clarify'),
+    ]);
+    routeOdoo(hUpdate);
+    await hUpdate.say('Actualiza Pioneer 2');
+    await hUpdate.say('¿Cómo queda?');
+    expect(hUpdate.sent[1].body).toBe('¿Lo actualizo? Responde «sí» para actualizarlo o dime qué cambiar.');
+
+    const hArchive = setup([
+      call('archive_product', { productId: 81 }),
+      decision('clarify'),
+    ]);
+    routeOdoo(hArchive);
+    await hArchive.say('Archiva Pioneer 2');
+    await hArchive.say('¿Se puede recuperar después?');
+    expect(hArchive.sent[1].body).toBe('¿Lo archivo? Responde «sí» para archivarlo o «no» para cancelar.');
+  });
+
+  it('notifies when product is not found in Odoo during update or archive', async () => {
+    const h = setup([
+      call('update_product', { productId: 999, name: 'Inexistente' }),
+      text('No encontrado'),
+    ]);
+    const route = routeOdoo(h);
+    route.product = null;
+    await h.say('Actualiza el producto 999');
+    expect(h.sent).toEqual([{ to: 'operator', body: 'No encontré el producto con ID 999 en Odoo.' }]);
+    expect(h.state().action).toBeUndefined();
+
+    const hArchive = setup([
+      call('archive_product', { productId: 999 }),
+      text('No encontrado'),
+    ]);
+    const routeArchive = routeOdoo(hArchive);
+    routeArchive.product = null;
+    await hArchive.say('Archiva el producto 999');
+    expect(hArchive.sent).toEqual([{ to: 'operator', body: 'No encontré el producto con ID 999 en Odoo.' }]);
+    expect(hArchive.state().action).toBeUndefined();
+  });
+
+  it('discards expired update and archive proposals', async () => {
+    const h = setup([
+      call('update_product', { productId: 81, name: 'Pioneer 3' }),
+      text('Continuando'),
+    ]);
+    routeOdoo(h);
+    await h.say('Actualiza Pioneer 2');
+    const pending = h.state().action!;
+    expect(pending.status).toBe('pending');
+
+    vi.spyOn(Date, 'now').mockReturnValue(pending.expiresAt + 1000);
+    await h.say('Sí, actualízalo');
+    expect(h.sent[1].body).toBe(expiredNotice);
+    expect(h.state().action?.status).toBe('cancelled');
+  });
+
+  it('previews single-field modifications accurately (reference and cost)', async () => {
+    const h = setup([
+      call('update_product', { productId: 81, reference: 'XDJ-NEW', cost: 28 }),
+      decision('approve'),
+      text('Listo'),
+    ]);
+    routeOdoo(h);
+    await h.say('Cambia la ref a XDJ-NEW y costo a 28');
+    const expectedPreview = [
+      'Voy a actualizar «Pioneer 2» (ID 81) en Odoo (catalog):',
+      '• Referencia: DDJ ➔ XDJ-NEW',
+      '• Costo: $20.00 ➔ $28.00',
+      '¿Lo actualizo? Responde «sí» o dime qué cambiar. Vence en 15 minutos.',
+    ].join('\n');
+    expect(h.sent[0].body).toBe(expectedPreview);
+    await h.say('Sí');
+    expect(writes(h)).toEqual([{
+      ids: [81],
+      vals: {
+        default_code: 'XDJ-NEW',
+        standard_price: 28,
+      },
+    }]);
+    expect(h.sent[1].body).toBe('Listo ✅ Actualicé «Pioneer 2» en Odoo (ID 81).');
   });
 });
 

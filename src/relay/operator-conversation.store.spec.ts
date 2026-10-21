@@ -1,7 +1,7 @@
 import { ConfigService } from '@nestjs/config';
 import type { ModelMessage } from 'ai';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { RelayStore, type ConversationAction } from './relay.store.js';
+import { RelayStore, type ConversationAction, type ConversationActionProposal } from './relay.store.js';
 
 const target = { url: 'https://odoo.test', db: 'catalog', companyId: 7 };
 const proposed: Omit<ConversationAction, 'status'> = { ...target, id: 'action-1', name: 'Pioneer', reference: 'DDJ',
@@ -130,5 +130,153 @@ describe('durable operator conversation public store contract', () => {
     expect(state().messages).toHaveLength(40);
     expect(state().messages.slice(-2)).toEqual(history);
     expect(state().action).toEqual(before.action);
+  });
+
+  it('reserves, authorizes, claims, and completes an update action', () => {
+    const updateProposed: ConversationActionProposal = {
+      kind: 'update',
+      ...target,
+      id: 'update-1',
+      productId: 42,
+      currentValues: { name: 'Pioneer', reference: 'DDJ', listPrice: 20, cost: 10, taxId: 1 },
+      proposedValues: {
+        name: 'Pioneer 2',
+        reference: 'DDJ-2',
+        price: { amount: 30, includesTax: true, tax: { id: 1, name: 'VAT 15%', percent: 15 }, listPrice: 26.09 },
+        cost: 15,
+      },
+      toolCallId: 'update-call-1',
+      approvalId: 'update-app-1',
+      authorityFingerprint: 'test-fingerprint',
+      expiresAt: 5000,
+    };
+    const updateHistory: ModelMessage[] = [
+      { role: 'user', content: 'Actualiza Pioneer' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', toolName: 'update_product', toolCallId: 'update-call-1', input: { productId: 42, name: 'Pioneer 2' } },
+          { type: 'tool-approval-request', approvalId: 'update-app-1', toolCallId: 'update-call-1' },
+        ],
+      },
+    ];
+
+    expect(store.reserveConversationAction('operator', 'business', 'turn-1', updateProposed, updateHistory)).toBe(true);
+    expect(state().action).toMatchObject({ kind: 'update', productId: 42, status: 'proposed' });
+    expect(store.bindConversationPreview('operator', 'business', 'turn-1', updateProposed.id, 'visible-update')).toBe(true);
+    expect(store.authorizeConversationAction('operator', 'business', 'turn-1', updateProposed.id, target, 1000)).toBe(true);
+
+    const matchingInput = {
+      productId: 42,
+      name: 'Pioneer 2',
+      reference: 'DDJ-2',
+      salePrice: 30,
+      priceIncludesTax: true,
+      cost: 15,
+    };
+    expect(store.claimConversationUpdate('operator', 'business', 'turn-1', updateProposed.id, 'wrong-call', matchingInput, target, 1000)).toBe(false);
+    expect(store.claimConversationUpdate('operator', 'business', 'turn-1', updateProposed.id, 'update-call-1', { ...matchingInput, productId: 99 }, target, 1000)).toBe(false);
+    expect(store.claimConversationUpdate('operator', 'business', 'turn-1', updateProposed.id, 'update-call-1', { ...matchingInput, name: 'Mismatch' }, target, 1000)).toBe(false);
+    expect(store.claimConversationUpdate('operator', 'business', 'turn-1', updateProposed.id, 'update-call-1', matchingInput, target, 6000)).toBe(false);
+
+    expect(store.claimConversationUpdate('operator', 'business', 'turn-1', updateProposed.id, 'update-call-1', matchingInput, target, 1000)).toBe(true);
+    expect(state().action?.status).toBe('creating');
+    expect(store.finishConversationAction('operator', 'business', 'turn-1', updateProposed.id, 'created')).toBe(true);
+    expect(state().action?.status).toBe('created');
+  });
+
+  it('reserves, authorizes, claims, and completes an archive action', () => {
+    const archiveProposed: ConversationActionProposal = {
+      kind: 'archive',
+      ...target,
+      id: 'archive-1',
+      productId: 88,
+      name: 'Old Pioneer',
+      reference: 'OLD-1',
+      toolCallId: 'archive-call-1',
+      approvalId: 'archive-app-1',
+      authorityFingerprint: 'test-fingerprint',
+      expiresAt: 5000,
+    };
+    const archiveHistory: ModelMessage[] = [
+      { role: 'user', content: 'Archiva Old Pioneer' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', toolName: 'archive_product', toolCallId: 'archive-call-1', input: { productId: 88 } },
+          { type: 'tool-approval-request', approvalId: 'archive-app-1', toolCallId: 'archive-call-1' },
+        ],
+      },
+    ];
+
+    expect(store.reserveConversationAction('operator', 'business', 'turn-1', archiveProposed, archiveHistory)).toBe(true);
+    expect(state().action).toMatchObject({ kind: 'archive', productId: 88, status: 'proposed' });
+    expect(store.bindConversationPreview('operator', 'business', 'turn-1', archiveProposed.id, 'visible-archive')).toBe(true);
+    expect(store.authorizeConversationAction('operator', 'business', 'turn-1', archiveProposed.id, target, 1000)).toBe(true);
+
+    expect(store.claimConversationArchive('operator', 'business', 'turn-1', archiveProposed.id, 'wrong-call', { productId: 88 }, target, 1000)).toBe(false);
+    expect(store.claimConversationArchive('operator', 'business', 'turn-1', archiveProposed.id, 'archive-call-1', { productId: 99 }, target, 1000)).toBe(false);
+    expect(store.claimConversationArchive('operator', 'business', 'turn-1', archiveProposed.id, 'archive-call-1', { productId: 88 }, target, 6000)).toBe(false);
+
+    expect(store.claimConversationArchive('operator', 'business', 'turn-1', archiveProposed.id, 'archive-call-1', { productId: 88 }, target, 1000)).toBe(true);
+    expect(state().action?.status).toBe('creating');
+    expect(store.finishConversationAction('operator', 'business', 'turn-1', archiveProposed.id, 'created')).toBe(true);
+    expect(state().action?.status).toBe('created');
+  });
+
+  it('rejects invalid update/archive reservations and cross-kind claims', () => {
+    const invalidUpdate: ConversationActionProposal = {
+      kind: 'update',
+      ...target,
+      id: 'update-inv',
+      productId: 0,
+      currentValues: { name: 'Pioneer' },
+      proposedValues: { cost: -5 },
+      toolCallId: 'update-call-inv',
+      approvalId: 'update-app-inv',
+      authorityFingerprint: 'test-fingerprint',
+      expiresAt: 5000,
+    };
+    const updateHistory: ModelMessage[] = [
+      { role: 'user', content: 'Actualiza' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', toolName: 'update_product', toolCallId: 'update-call-inv', input: { productId: 0 } },
+          { type: 'tool-approval-request', approvalId: 'update-app-inv', toolCallId: 'update-call-inv' },
+        ],
+      },
+    ];
+
+    expect(store.reserveConversationAction('operator', 'business', 'turn-1', invalidUpdate, updateHistory)).toBe(false);
+
+    const validArchive: ConversationActionProposal = {
+      kind: 'archive',
+      ...target,
+      id: 'archive-val',
+      productId: 77,
+      name: 'Pioneer',
+      toolCallId: 'archive-call-val',
+      approvalId: 'archive-app-val',
+      authorityFingerprint: 'test-fingerprint',
+      expiresAt: 5000,
+    };
+    const archiveHistory: ModelMessage[] = [
+      { role: 'user', content: 'Archiva' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', toolName: 'archive_product', toolCallId: 'archive-call-val', input: { productId: 77 } },
+          { type: 'tool-approval-request', approvalId: 'archive-app-val', toolCallId: 'archive-call-val' },
+        ],
+      },
+    ];
+
+    expect(store.reserveConversationAction('operator', 'business', 'turn-1', validArchive, archiveHistory)).toBe(true);
+    expect(store.bindConversationPreview('operator', 'business', 'turn-1', validArchive.id, 'preview-msg')).toBe(true);
+
+    // Cancel action works while pending
+    expect(store.cancelConversationAction('operator', 'business', 'turn-1', validArchive.id)).toBe(true);
+    expect(state().action?.status).toBe('cancelled');
   });
 });
