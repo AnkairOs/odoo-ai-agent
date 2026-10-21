@@ -19,6 +19,7 @@ import {
 } from '../odoo/odoo-product-update.service.js';
 import { OdooProductsService } from '../odoo/odoo-products.service.js';
 import { OdooTaxesService } from '../odoo/odoo-taxes.service.js';
+import { OdooOperatorService } from '../odoo/odoo-operator.service.js';
 import type { InboundMessage } from './kapso-payload.js';
 import {
   conversationArchiveBatchPayloadSchema,
@@ -81,6 +82,12 @@ const archiveProductToolSchema = z.object({
   productId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
 }).strict();
 
+const setCustomerInquiriesToolSchema = z.object({
+  enabled: z.boolean(),
+}).strict();
+
+const getCustomerInquiriesStatusToolSchema = z.object({}).strict();
+
 const decisionSchema = z.object({ decision: z.enum(['approve', 'reject', 'clarify', 'change']) }).strict();
 
 type SafeBatchUpdateResult =
@@ -142,10 +149,11 @@ export class OperatorConversationService {
     private readonly updateService: OdooProductUpdateService,
     private readonly taxes: OdooTaxesService,
     @Inject(WHATSAPP_SENDER) private readonly sender: WhatsAppSender,
+    private readonly operatorService?: OdooOperatorService,
   ) {}
 
   async handle(message: InboundMessage): Promise<boolean> {
-    if (!this.eligible(message) || !this.ai.isEnabled()) return false;
+    if (!(await this.eligible(message)) || !this.ai.isEnabled()) return false;
     const operator = message.from;
     const business = message.phoneNumberId;
     if (!this.store.claimConversationTurn(operator, business, message.id)) return true;
@@ -161,8 +169,8 @@ export class OperatorConversationService {
     return true;
   }
 
-  private eligible(message: InboundMessage): boolean {
-    const operator = this.config.get<string>('RELAY_OPERATOR_WA_ID');
+  private async eligible(message: InboundMessage): Promise<boolean> {
+    const operator = (await this.operatorService?.resolveOperatorPhone()) ?? this.config.get<string>('RELAY_OPERATOR_WA_ID');
     const business = this.config.get<string>('KAPSO_PHONE_NUMBER_ID');
     return !!operator && !!business && message.from === operator && message.phoneNumberId === business &&
       !message.quotedMessageId && typeof message.text === 'string' && !!message.text.trim() &&
@@ -192,7 +200,7 @@ export class OperatorConversationService {
       const approve = decision === 'approve';
       const target = this.creation.destination();
       const changed = approve
-        ? target && this.eligible(message) && action.authorityFingerprint === this.authorityFingerprint() && this.store.authorizeConversationAction(message.from, message.phoneNumberId,
+        ? target && (await this.eligible(message)) && action.authorityFingerprint === this.authorityFingerprint() && this.store.authorizeConversationAction(message.from, message.phoneNumberId,
           message.id, action.id, target, Date.now())
         : this.store.cancelConversationAction(message.from, message.phoneNumberId, message.id, action.id);
       if (!changed) {
@@ -341,7 +349,7 @@ export class OperatorConversationService {
       tools.search_products = defineAiTool({
         description: 'Buscar productos activos en Odoo. Si se omite query, lista los productos más recientes ordenados por novedad. Acepta offset opcional para paginar. Devuelve id, nombre, referencia, precio de venta (list_price), impuestos y total.',
         inputSchema: searchProductsToolSchema,
-        execute: async (input) => this.eligible(message) ? this.products.search(input) : { status: 'unavailable' },
+        execute: async (input) => (await this.eligible(message)) ? this.products.search(input) : { status: 'unavailable' },
       });
     }
     if (this.creation.destination()) {
@@ -350,7 +358,7 @@ export class OperatorConversationService {
         inputSchema: z.object({}).strict(),
         execute: async () => {
           const target = this.creation.destination();
-          return target && this.eligible(message) ? this.taxes.listSaleTaxes(target) : { status: 'unavailable' };
+          return target && (await this.eligible(message)) ? this.taxes.listSaleTaxes(target) : { status: 'unavailable' };
         },
       });
       tools.create_product = defineAiTool({
@@ -402,13 +410,27 @@ export class OperatorConversationService {
         },
       });
     }
+    tools.set_customer_inquiries = defineAiTool({
+      description:
+        'Pausar o reanudar la recepción y atención automática de consultas de clientes por WhatsApp. Si enabled=false, las consultas entrantes de clientes se ignoran en silencio total para que un humano responda directamente sin interferencias. Si enabled=true, se reactiva la atención automática.',
+      inputSchema: setCustomerInquiriesToolSchema,
+      execute: async (input) => {
+        this.store.setCustomerInquiriesEnabled(input.enabled);
+        return { status: 'ok', enabled: input.enabled };
+      },
+    });
+    tools.get_customer_inquiries_status = defineAiTool({
+      description: 'Consultar el estado actual del interruptor de consultas de clientes (activo o pausado).',
+      inputSchema: getCustomerInquiriesStatusToolSchema,
+      execute: async () => ({ status: 'ok', enabled: this.store.isCustomerInquiriesEnabled() }),
+    });
     return tools;
   }
 
   private async executeCreation(message: InboundMessage, input: ConversationProduct, toolCallId: string) {
     const action = this.store.getOperatorConversation(message.from, message.phoneNumberId).action;
     const target = this.creation.destination();
-    if (!action || (action.kind !== undefined && action.kind !== 'create') || !target || !this.eligible(message) || action.authorityFingerprint !== this.authorityFingerprint()) {
+    if (!action || (action.kind !== undefined && action.kind !== 'create') || !target || !(await this.eligible(message)) || action.authorityFingerprint !== this.authorityFingerprint()) {
       return { status: 'blocked' };
     }
     const taxIsCurrent = await this.hasCurrentTax(action, target);
@@ -428,7 +450,7 @@ export class OperatorConversationService {
   private async executeUpdate(message: InboundMessage, input: ConversationProductUpdateInput, toolCallId: string) {
     const action = this.store.getOperatorConversation(message.from, message.phoneNumberId).action;
     const target = this.creation.destination();
-    if (!action || action.kind !== 'update' || !target || !this.eligible(message) || action.authorityFingerprint !== this.authorityFingerprint()) {
+    if (!action || action.kind !== 'update' || !target || !(await this.eligible(message)) || action.authorityFingerprint !== this.authorityFingerprint()) {
       return { status: 'blocked' };
     }
     const taxIsCurrent = await this.hasCurrentTaxForUpdate(action, target);
@@ -454,7 +476,7 @@ export class OperatorConversationService {
   private async executeArchive(message: InboundMessage, input: ConversationProductArchiveInput, toolCallId: string) {
     const action = this.store.getOperatorConversation(message.from, message.phoneNumberId).action;
     const target = this.creation.destination();
-    if (!action || action.kind !== 'archive' || !target || !this.eligible(message) || action.authorityFingerprint !== this.authorityFingerprint()) {
+    if (!action || action.kind !== 'archive' || !target || !(await this.eligible(message)) || action.authorityFingerprint !== this.authorityFingerprint()) {
       return { status: 'blocked' };
     }
     if (!this.store.claimConversationArchive(message.from, message.phoneNumberId, message.id,
@@ -480,7 +502,7 @@ export class OperatorConversationService {
       !action ||
       action.kind !== 'create_batch' ||
       !target ||
-      !this.eligible(message) ||
+      !(await this.eligible(message)) ||
       action.authorityFingerprint !== this.authorityFingerprint()
     ) {
       return { status: 'rejected' };
@@ -552,7 +574,7 @@ export class OperatorConversationService {
       !action ||
       action.kind !== 'update_batch' ||
       !target ||
-      !this.eligible(message) ||
+      !(await this.eligible(message)) ||
       action.authorityFingerprint !== this.authorityFingerprint()
     ) {
       return { status: 'rejected', updatedIds: [], rejectedIds: [], unknownIds: [], notAttemptedIds: [] };
@@ -647,7 +669,7 @@ export class OperatorConversationService {
       !action ||
       action.kind !== 'archive_batch' ||
       !target ||
-      !this.eligible(message) ||
+      !(await this.eligible(message)) ||
       action.authorityFingerprint !== this.authorityFingerprint()
     ) {
       return { status: 'rejected' };
@@ -767,7 +789,7 @@ export class OperatorConversationService {
   private async propose(message: InboundMessage, history: ModelMessage[], approvals: ConversationApproval[]): Promise<void> {
     const approval = approvals[0];
     const target = this.creation.destination();
-    if (approvals.length !== 1 || !target || !this.eligible(message)) {
+    if (approvals.length !== 1 || !target || !(await this.eligible(message))) {
       this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
       await this.notice(message.from, BATCH_SUPPORTED);
       return;
@@ -1212,7 +1234,17 @@ export class OperatorConversationService {
 }
 
 function instructions(tools: AiToolSet): string {
-  const capabilities = Object.entries(tools).map(([name, tool]) => `${name}: ${tool.description}`).join('\n');
+  const odooCapabilities = Object.entries(tools)
+    .filter(([name]) => !['set_customer_inquiries', 'get_customer_inquiries_status'].includes(name))
+    .map(([name, tool]) => `${name}: ${tool.description}`)
+    .join('\n');
+  const controlCapabilities = Object.entries(tools)
+    .filter(([name]) => ['set_customer_inquiries', 'get_customer_inquiries_status'].includes(name))
+    .map(([name, tool]) => `${name}: ${tool.description}`)
+    .join('\n');
+  const capabilities = [controlCapabilities, odooCapabilities || '(ninguna operación Odoo disponible)']
+    .filter(Boolean)
+    .join('\n');
   return [
     'Eres el asistente privado del operador por WhatsApp. Conversa en español natural y cercano.',
     'Responde corto: 1 a 3 frases en texto plano. Nunca uses tablas, encabezados ni Markdown; solo puedes resaltar con *un asterisco*. Para varios productos usa una línea por producto que empiece con «• ».',
@@ -1220,7 +1252,9 @@ function instructions(tools: AiToolSet): string {
     'Nunca menciones nombres de herramientas, pasos internos, IDs internos, códigos técnicos de tipo ni configuración.',
     'Decide tú cuándo responder, preguntar o usar herramientas; puedes consultar varias veces. Herramientas disponibles:',
     capabilities || '(ninguna operación Odoo disponible)',
-    'No tienes otras operaciones. Ofrece solo lo que esas herramientas permiten: buscar productos, proponer crear un nuevo producto o varios en lote (2 a 20 productos), actualizar campos de productos existentes individualmente o en lote (2 a 20 productos) o archivarlos (individual o en lote de 2 a 50 productos). Nunca ofrezcas editar productos o añadir referencias a productos existentes fuera de las herramientas de actualización y archivo, ni cambiar stock o imágenes, ni borrar definitivamente. Nunca prometas pedidos ni compras.',
+    'No tienes otras operaciones. Ofrece solo lo que esas herramientas permiten: pausar o reanudar consultas de clientes, consultar el estado de consultas de clientes, buscar productos, proponer crear un nuevo producto o varios en lote (2 a 20 productos), actualizar campos de productos existentes individualmente o en lote (2 a 20 productos) o archivarlos (individual o en lote de 2 a 50 productos). Nunca ofrezcas editar productos o añadir referencias a productos existentes fuera de las herramientas de actualización y archivo, ni cambiar stock o imágenes, ni borrar definitivamente. Nunca prometas pedidos ni compras.',
+    'Si el operador pide pausar, detener o silenciar la recepción de mensajes o consultas de clientes, o reanudarlas o reactivarlas en lenguaje natural, invoca la herramienta set_customer_inquiries con enabled=false o enabled=true según corresponda. Responde de forma cercana y concisa en español confirmando el nuevo estado (por ejemplo, «Listo, pausé las consultas de clientes...» o «Listo, reactivé las consultas de clientes...»).',
+    'Si el operador pregunta si las consultas están activas o pausadas, usa get_customer_inquiries_status e infórmale de forma concisa.',
     'Si el operador pregunta qué productos hay o pide ver el catálogo general, usa search_products sin query. Menciona el total de productos y lista los devueltos con su precio de venta.',
     'Si el operador pide ver más o siguientes productos, usa search_products con el offset correspondiente.',
     'Si el operador pregunta precios de los productos encontrados, indícaselos basándote en el list_price de los resultados.',

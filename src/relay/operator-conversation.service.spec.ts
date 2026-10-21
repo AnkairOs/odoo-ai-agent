@@ -14,6 +14,7 @@ import { OdooProductUpdateService } from '../odoo/odoo-product-update.service.js
 import { OdooProductsService } from '../odoo/odoo-products.service.js';
 import { OdooClientService } from '../odoo/odoo-client.service.js';
 import { OdooTaxesService } from '../odoo/odoo-taxes.service.js';
+import { OdooOperatorService } from '../odoo/odoo-operator.service.js';
 import { formatModelReply, OperatorConversationService } from './operator-conversation.service.js';
 import { RelayStore } from './relay.store.js';
 import type { InboundMessage } from './kapso-payload.js';
@@ -43,7 +44,7 @@ const SALE_TAXES = [{ id: 1, name: 'VAT 15% G', amount: 15, price_include: false
 const stores: RelayStore[] = [];
 const dirs: string[] = [];
 
-function setup(results: (Result | Error)[], overrides: Record<string, string> = {}) {
+function setup(results: (Result | Error)[], overrides: Record<string, string> = {}, operatorService?: OdooOperatorService) {
   const env = { ...ENV, RELAY_DB_PATH: ':memory:', ...overrides };
   const config = new ConfigService(env);
   const queue = [...results];
@@ -67,7 +68,7 @@ function setup(results: (Result | Error)[], overrides: Record<string, string> = 
   const client = new OdooClientService(config);
   const products = new OdooProductsService(client, config);
   const taxes = new OdooTaxesService(client, config);
-  const service = new OperatorConversationService(config, store, ai, products, creation, updateService, taxes, { sendText });
+  const service = new OperatorConversationService(config, store, ai, products, creation, updateService, taxes, { sendText }, operatorService);
   const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response('[81]', { status: 200 }));
   vi.stubGlobal('fetch', fetchMock);
   let event = 0;
@@ -150,7 +151,9 @@ describe('private operator conversation through the real SDK', () => {
       ConfigModule.forRoot({ isGlobal: true, ignoreEnvFile: true, ignoreEnvVars: true,
         load: [() => ({ ...ENV, RELAY_DB_PATH: ':memory:' })] }), RelayModule,
     ] }).overrideProvider(AI_MODEL_FACTORY).useValue(() => ({ model }))
-      .overrideProvider(WHATSAPP_SENDER).useValue({ sendText }).compile();
+      .overrideProvider(WHATSAPP_SENDER).useValue({ sendText })
+      .overrideProvider(OdooOperatorService).useValue({ resolveOperatorPhone: vi.fn().mockResolvedValue('operator') })
+      .compile();
     await module.init();
     try {
       const relay = module.get(RelayService);
@@ -188,6 +191,8 @@ describe('private operator conversation through the real SDK', () => {
       'create_products',
       'update_products',
       'archive_products',
+      'set_customer_inquiries',
+      'get_customer_inquiries_status',
     ]);
     expect(h.model.doGenerateCalls[0].prompt[0]).toMatchObject({ role: 'system', content: expect.stringContaining('search_products:') });
   });
@@ -195,7 +200,10 @@ describe('private operator conversation through the real SDK', () => {
   it('does not advertise unavailable tools or enabled mutation without explicit opt-in', async () => {
     const h = setup([text('Hola, no tengo operaciones Odoo disponibles.')], { ODOO_DEFAULT_API_KEY: '', ODOO_PRODUCT_CREATION_ENABLED: 'false' });
     await h.say('Hola');
-    expect(h.model.doGenerateCalls[0].tools ?? []).toEqual([]);
+    expect(h.model.doGenerateCalls[0].tools?.map((tool) => tool.name) ?? []).toEqual([
+      'set_customer_inquiries',
+      'get_customer_inquiries_status',
+    ]);
     expect(h.model.doGenerateCalls[0].prompt[0]).toMatchObject({ content: expect.stringContaining('(ninguna operación Odoo disponible)') });
     expect(h.fetchMock).not.toHaveBeenCalled();
   });
@@ -1390,6 +1398,137 @@ describe('priced product creation in the operator conversation', () => {
       expect(system).toContain('update_products');
       expect(system).toContain('archive_products');
       expect(system).toContain('pregunta proactivamente si desea continuar con el siguiente paso');
+    });
+  });
+
+  describe('customer inquiries switch and dynamic operator phone resolution (T3 S4)', () => {
+    it('calls set_customer_inquiries with enabled=false when operator requests pausing queries', async () => {
+      const h = setup([
+        call('set_customer_inquiries', { enabled: false }, 'pause-1'),
+        text('Listo, pausé las consultas de clientes. Ahora puedes responder directamente sin interferencias.'),
+      ]);
+      expect(h.store.isCustomerInquiriesEnabled()).toBe(true);
+
+      const handled = await h.say('Pausa las consultas de clientes');
+      expect(handled).toBe(true);
+      expect(h.store.isCustomerInquiriesEnabled()).toBe(false);
+      expect(h.sent).toEqual([
+        { to: 'operator', body: 'Listo, pausé las consultas de clientes. Ahora puedes responder directamente sin interferencias.' },
+      ]);
+      const history = h.state().messages;
+      expect(history.map((m) => m.role)).toEqual(['user', 'assistant', 'tool', 'assistant']);
+      expect(JSON.stringify(history)).toContain('"status":"ok"');
+      expect(JSON.stringify(history)).toContain('"enabled":false');
+      expect(h.state().action).toBeUndefined();
+    });
+
+    it('calls set_customer_inquiries with enabled=true when operator requests resuming queries', async () => {
+      const h = setup([
+        call('set_customer_inquiries', { enabled: true }, 'resume-1'),
+        text('Listo, reactivé las consultas de clientes. La atención automática está nuevamente activa.'),
+      ]);
+      h.store.setCustomerInquiriesEnabled(false);
+      expect(h.store.isCustomerInquiriesEnabled()).toBe(false);
+
+      const handled = await h.say('Reactiva las consultas de clientes');
+      expect(handled).toBe(true);
+      expect(h.store.isCustomerInquiriesEnabled()).toBe(true);
+      expect(h.sent).toEqual([
+        { to: 'operator', body: 'Listo, reactivé las consultas de clientes. La atención automática está nuevamente activa.' },
+      ]);
+      const history = h.state().messages;
+      expect(history.map((m) => m.role)).toEqual(['user', 'assistant', 'tool', 'assistant']);
+      expect(JSON.stringify(history)).toContain('"status":"ok"');
+      expect(JSON.stringify(history)).toContain('"enabled":true');
+      expect(h.state().action).toBeUndefined();
+    });
+
+    it('queries status with get_customer_inquiries_status when operator asks about switch state', async () => {
+      const h = setup([
+        call('get_customer_inquiries_status', {}, 'status-1'),
+        text('Las consultas de clientes están actualmente activas.'),
+      ]);
+      expect(h.store.isCustomerInquiriesEnabled()).toBe(true);
+
+      const handled = await h.say('¿Cómo están las consultas de clientes?');
+      expect(handled).toBe(true);
+      expect(h.sent).toEqual([
+        { to: 'operator', body: 'Las consultas de clientes están actualmente activas.' },
+      ]);
+      const history = h.state().messages;
+      expect(history.map((m) => m.role)).toEqual(['user', 'assistant', 'tool', 'assistant']);
+      expect(JSON.stringify(history)).toContain('"status":"ok"');
+      expect(JSON.stringify(history)).toContain('"enabled":true');
+    });
+
+    it('queries status with get_customer_inquiries_status when inquiries are paused', async () => {
+      const h = setup([
+        call('get_customer_inquiries_status', {}, 'status-2'),
+        text('Las consultas de clientes están pausadas.'),
+      ]);
+      h.store.setCustomerInquiriesEnabled(false);
+
+      const handled = await h.say('¿Están pausadas las consultas?');
+      expect(handled).toBe(true);
+      expect(h.sent).toEqual([
+        { to: 'operator', body: 'Las consultas de clientes están pausadas.' },
+      ]);
+      const history = h.state().messages;
+      expect(JSON.stringify(history)).toContain('"enabled":false');
+    });
+
+    it('resolves operator phone dynamically using OdooOperatorService', async () => {
+      const dynamicPhone = '593992849536';
+      const mockOperatorService = {
+        resolveOperatorPhone: vi.fn().mockResolvedValue(dynamicPhone),
+        clearCache: vi.fn(),
+      } as unknown as OdooOperatorService;
+
+      const h = setup([text('Hola, soy el asistente.')], {}, mockOperatorService);
+
+      const handledDynamic = await h.service.handle(
+        h.message('Hola', { from: dynamicPhone }),
+      );
+      expect(handledDynamic).toBe(true);
+      expect(mockOperatorService.resolveOperatorPhone).toHaveBeenCalled();
+      expect(h.sent).toEqual([{ to: dynamicPhone, body: 'Hola, soy el asistente.' }]);
+
+      const handledOld = await h.service.handle(
+        h.message('Hola', { from: 'operator' }),
+      );
+      expect(handledOld).toBe(false);
+    });
+
+    it('falls back to RELAY_OPERATOR_WA_ID when OdooOperatorService resolves to undefined', async () => {
+      const mockOperatorService = {
+        resolveOperatorPhone: vi.fn().mockResolvedValue(undefined),
+        clearCache: vi.fn(),
+      } as unknown as OdooOperatorService;
+
+      const h = setup([text('Hola desde fallback.')], { RELAY_OPERATOR_WA_ID: 'fallback-op' }, mockOperatorService);
+
+      const handled = await h.service.handle(
+        h.message('Hola', { from: 'fallback-op' }),
+      );
+      expect(handled).toBe(true);
+      expect(mockOperatorService.resolveOperatorPhone).toHaveBeenCalled();
+      expect(h.sent).toEqual([{ to: 'fallback-op', body: 'Hola desde fallback.' }]);
+
+      const unhandled = await h.service.handle(
+        h.message('Hola', { from: 'other-phone' }),
+      );
+      expect(unhandled).toBe(false);
+    });
+
+    it('includes customer inquiries tools and instructions in the system prompt', async () => {
+      const h = setup([text('Hola')]);
+      await h.say('Hola');
+      const system = String(h.model.doGenerateCalls[0].prompt[0].content);
+      expect(system).toContain('set_customer_inquiries');
+      expect(system).toContain('get_customer_inquiries_status');
+      expect(system).toContain('pausar, detener o silenciar la recepción de mensajes o consultas de clientes');
+      expect(system).toContain('Listo, pausé las consultas de clientes');
+      expect(system).toContain('Listo, reactivé las consultas de clientes');
     });
   });
 });
