@@ -9,6 +9,7 @@ import { Consultation, RelayStore } from './relay.store.js';
 import { ReplySuggester } from './reply-suggester.js';
 import { WHATSAPP_SENDER } from './whatsapp-sender.js';
 import type { WhatsAppSender } from './whatsapp-sender.js';
+import { OdooOperatorService } from '../odoo/odoo-operator.service.js';
 
 @Injectable()
 export class RelayService {
@@ -22,19 +23,30 @@ export class RelayService {
     private readonly suggester: ReplySuggester,
     private readonly products: OperatorProductsService,
     private readonly conversation: OperatorConversationService,
+    private readonly operatorService: OdooOperatorService,
   ) {}
 
-  async handle(messages: InboundMessage[]): Promise<void> {
+  async handle(message: InboundMessage): Promise<boolean>;
+  async handle(messages: InboundMessage[]): Promise<boolean>;
+  async handle(input: InboundMessage | InboundMessage[]): Promise<boolean> {
     const businessPhoneId = this.configService.get<string>(
       'KAPSO_PHONE_NUMBER_ID',
     );
-    const operatorWaId = this.configService.get<string>('RELAY_OPERATOR_WA_ID');
+    const operatorWaId = await this.resolveOperatorWaId();
     if (!businessPhoneId || !operatorWaId) {
       this.logger.error(
         'Relay is not configured (KAPSO_PHONE_NUMBER_ID / RELAY_OPERATOR_WA_ID); message ignored',
       );
-      return;
+      return false;
     }
+
+    if (!Array.isArray(input)) {
+      if (input.from !== operatorWaId && !this.store.isCustomerInquiriesEnabled()) {
+        return true;
+      }
+    }
+
+    const messages = Array.isArray(input) ? input : [input];
     const fresh = messages.filter((message) =>
       this.accept(message, businessPhoneId),
     );
@@ -42,9 +54,21 @@ export class RelayService {
       if (unit.kind === 'operator') {
         await this.handleOperatorReply(unit.message, operatorWaId);
       } else {
+        if (!this.store.isCustomerInquiriesEnabled()) {
+          continue;
+        }
         await this.handleCustomerMessages(unit.messages, operatorWaId);
       }
     }
+    return true;
+  }
+
+  private async resolveOperatorWaId(): Promise<string | undefined> {
+    const configured = this.configService.get<string>('RELAY_OPERATOR_WA_ID');
+    if (configured === 'operator') {
+      return 'operator';
+    }
+    return (await this.operatorService.resolveOperatorPhone()) ?? configured;
   }
 
   private accept(message: InboundMessage, businessPhoneId: string): boolean {
