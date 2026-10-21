@@ -92,14 +92,30 @@ function routeOdoo(h: ReturnType<typeof setup>) {
       taxes_id: [1],
       active: true,
     } as unknown,
+    products: [] as unknown[],
     productStatus: 200,
   };
-  h.fetchMock.mockImplementation(async (url) => {
+  h.fetchMock.mockImplementation(async (url, init) => {
     const path = String(url);
     if (path.endsWith('/account.tax/search_read')) return new Response(JSON.stringify(route.taxes), { status: route.taxStatus });
     if (path.endsWith('/res.company/read')) return new Response('[{"id":7,"account_sale_tax_id":[1,"VAT 15% G"]}]');
-    if (path.endsWith('/product.product/read')) return new Response(JSON.stringify(route.product ? [route.product] : []), { status: route.productStatus });
+    if (path.endsWith('/product.product/read')) {
+      if (route.products.length > 0) {
+        const body = JSON.parse(String(init?.body || '{}')) as { ids?: number[] };
+        const id = Array.isArray(body?.ids) ? body.ids[0] : undefined;
+        const matched = route.products.find(
+          (p) => typeof p === 'object' && p !== null && 'id' in p && (p as { id: number }).id === id,
+        );
+        return new Response(JSON.stringify(matched ? [matched] : []), { status: route.productStatus });
+      }
+      return new Response(JSON.stringify(route.product ? [route.product] : []), { status: route.productStatus });
+    }
     if (path.endsWith('/product.product/write')) return new Response('true', { status: 200 });
+    if (path.endsWith('/product.product/create')) {
+      const body = JSON.parse(String(init?.body || '{}')) as { vals_list?: unknown[] };
+      const count = Array.isArray(body?.vals_list) ? body.vals_list.length : 1;
+      return new Response(JSON.stringify(Array.from({ length: count }, (_, i) => 81 + i)));
+    }
     return new Response('[81]');
   });
   return route;
@@ -163,7 +179,16 @@ describe('private operator conversation through the real SDK', () => {
     expect(h.state().messages).toEqual([{ role: 'user', content: 'Hola, ¿qué puedes hacer?' },
       { role: 'assistant', content: [{ type: 'text', text: h.sent[0].body }] }]);
     const tools = h.model.doGenerateCalls[0].tools;
-    expect(tools?.map((tool) => tool.name)).toEqual(['search_products', 'list_sales_taxes', 'create_product', 'update_product', 'archive_product']);
+    expect(tools?.map((tool) => tool.name)).toEqual([
+      'search_products',
+      'list_sales_taxes',
+      'create_product',
+      'update_product',
+      'archive_product',
+      'create_products',
+      'update_products',
+      'archive_products',
+    ]);
     expect(h.model.doGenerateCalls[0].prompt[0]).toMatchObject({ role: 'system', content: expect.stringContaining('search_products:') });
   });
 
@@ -507,7 +532,7 @@ describe('private operator conversation through the real SDK', () => {
     const h = setup([parallel, text('¿Qué producto deseas proponer?')]);
     await h.say('Crea One y Two');
     expect(h.state().action).toBeUndefined();
-    expect(h.sent[0].body).toBe('Puedo crear un producto a la vez. Dime el nombre del primero.');
+    expect(h.sent[0].body).toBe('Puedo crear, editar o archivar varios productos a la vez con una sola confirmación. Dime los productos y los preparo en lote.');
     await h.say('Sí, créalos');
     expect(h.fetchMock).not.toHaveBeenCalled();
     expect(JSON.stringify(h.state().messages)).toContain('"approved":false');
@@ -996,6 +1021,376 @@ describe('priced product creation in the operator conversation', () => {
       },
     }]);
     expect(h.sent[1].body).toBe('Listo ✅ Actualicé «Pioneer 2» en Odoo (ID 81).');
+  });
+
+  describe('batch operations in operator conversation (S1–S5)', () => {
+    it('previews consolidated batch creation and creates products via vals_list on single approval', async () => {
+      const h = setup([
+        call('create_products', {
+          items: [
+            { name: 'Pioneer 2', reference: 'DDJ', salePrice: 45, priceIncludesTax: true, cost: 30 },
+            { name: 'Sony Alpha', salePrice: 100, priceIncludesTax: true },
+          ],
+        }),
+        decision('approve'),
+        text('Listo'),
+      ]);
+      routeOdoo(h);
+      await h.say('Crea Pioneer 2 ref DDJ a 45 con IVA y costo 30, y Sony Alpha a 100 con IVA');
+
+      const expectedPreview = [
+        'Voy a crear estos 2 productos en Odoo (catalog):',
+        '• Pioneer 2 – ref: DDJ – $39.13 + IVA 15% = $45.00 – costo: $30.00',
+        '• Sony Alpha – sin ref – $86.96 + IVA 15% = $100.00',
+        '¿Los creo? Responde «sí» para crearlos o dime qué cambiar. Vence en 15 minutos.',
+      ].join('\n');
+      expect(h.sent[0].body).toBe(expectedPreview);
+      expect(h.state().action).toMatchObject({
+        kind: 'create_batch',
+        status: 'pending',
+      });
+
+      await h.say('dale');
+      expect(creates(h)).toEqual([{
+        vals_list: [
+          {
+            name: 'Pioneer 2',
+            default_code: 'DDJ',
+            type: 'consu',
+            is_storable: false,
+            company_id: 7,
+            list_price: 39.13,
+            taxes_id: [[6, 0, [1]]],
+            standard_price: 30,
+          },
+          {
+            name: 'Sony Alpha',
+            type: 'consu',
+            is_storable: false,
+            company_id: 7,
+            list_price: 86.96,
+            taxes_id: [[6, 0, [1]]],
+          },
+        ],
+      }]);
+      expect(h.sent[1].body).toBe('¡Listo! Creé los 2 productos en Odoo. ¿Deseas hacer algo más con ellos o buscar en el catálogo?');
+      expect(h.state().action).toMatchObject({
+        status: 'created',
+        outcome: { completedProductIds: [81, 82], uncertainProductIds: [] },
+      });
+    });
+
+    it('previews comparative batch update and updates products on single approval', async () => {
+      const h = setup([
+        call('update_products', {
+          items: [
+            { productId: 81, salePrice: 40, priceIncludesTax: true },
+            { productId: 82, cost: 60 },
+          ],
+        }),
+        decision('approve'),
+        text('Listo'),
+      ]);
+      const route = routeOdoo(h);
+      route.products = [
+        { id: 81, name: 'Pioneer 2', default_code: 'DDJ', list_price: 26.09, standard_price: 20, taxes_id: [1], active: true },
+        { id: 82, name: 'Sony Alpha', default_code: 'ALPHA', list_price: 80, standard_price: 50, taxes_id: [1], active: true },
+      ];
+      await h.say('Actualiza el precio de Pioneer 2 a 40 con IVA y el costo de Sony Alpha a 60');
+
+      const expectedPreview = [
+        'Voy a actualizar estos 2 productos en Odoo (catalog):',
+        '• ID 81 (Pioneer 2): precio: $26.09 (+ IVA 15% = $30.00) ➔ $34.78 (+ IVA 15% = $40.00)',
+        '• ID 82 (Sony Alpha): costo: $50.00 ➔ $60.00',
+        '¿Los actualizo? Responde «sí» o dime qué cambiar. Vence en 15 minutos.',
+      ].join('\n');
+      expect(h.sent[0].body).toBe(expectedPreview);
+      expect(h.state().action).toMatchObject({
+        kind: 'update_batch',
+        status: 'pending',
+      });
+
+      await h.say('Sí');
+      expect(writes(h)).toHaveLength(2);
+      expect(h.sent[1].body).toBe('¡Listo! Actualicé los 2 productos en Odoo. ¿Deseas consultar cómo quedaron o realizar otra modificación?');
+      expect(h.state().action).toMatchObject({
+        status: 'created',
+        outcome: { completedProductIds: [81, 82], uncertainProductIds: [] },
+      });
+    });
+
+    it('reports partial outcome with updated and unadjusted IDs when batch update partially fails', async () => {
+      const h = setup([
+        call('update_products', {
+          items: [
+            { productId: 81, salePrice: 40, priceIncludesTax: true },
+            { productId: 82, cost: 60 },
+          ],
+        }),
+        decision('approve'),
+        text('Continuando'),
+      ]);
+      const route = routeOdoo(h);
+      route.products = [
+        { id: 81, name: 'Pioneer 2', default_code: 'DDJ', list_price: 26.09, standard_price: 20, taxes_id: [1], active: true },
+        { id: 82, name: 'Sony Alpha', default_code: 'ALPHA', list_price: 80, standard_price: 50, taxes_id: [1], active: true },
+      ];
+      await h.say('Actualiza los dos productos');
+
+      let writeCount = 0;
+      h.fetchMock.mockImplementation(async (url) => {
+        const path = String(url);
+        if (path.endsWith('/account.tax/search_read')) return new Response(JSON.stringify(route.taxes), { status: 200 });
+        if (path.endsWith('/res.company/read')) return new Response('[{"id":7,"account_sale_tax_id":[1,"VAT 15% G"]}]');
+        if (path.endsWith('/product.product/write')) {
+          writeCount++;
+          if (writeCount === 1) return new Response('true', { status: 200 });
+          return new Response('Forbidden', { status: 403 });
+        }
+        return new Response('[81]');
+      });
+
+      await h.say('hazlo');
+      expect(h.sent[1].body).toBe(
+        'Actualicé 1 de 2 productos en Odoo. Los productos con ID [82] no se modificaron. Revísalos en Odoo.',
+      );
+      expect(h.state().action).toMatchObject({
+        kind: 'update_batch',
+        status: 'rejected',
+        outcome: { completedProductIds: [81], uncertainProductIds: [] },
+      });
+    });
+
+    it('previews batch archive and deactivates products on single confirmation', async () => {
+      const h = setup([
+        call('archive_products', {
+          items: [{ productId: 81 }, { productId: 82 }],
+        }),
+        decision('approve'),
+        text('Listo'),
+      ]);
+      const route = routeOdoo(h);
+      route.products = [
+        { id: 81, name: 'Pioneer 2', default_code: 'DDJ', list_price: 26.09, standard_price: 20, taxes_id: [1], active: true },
+        { id: 82, name: 'Sony Alpha', default_code: false, list_price: 80, standard_price: 50, taxes_id: [1], active: true },
+      ];
+      await h.say('Archiva los productos 81 y 82');
+
+      const expectedPreview = [
+        'Voy a archivar estos 2 productos en Odoo (catalog):',
+        '• ID 81: Pioneer 2 (ref: DDJ)',
+        '• ID 82: Sony Alpha',
+        '• Los productos quedarán archivados y ocultos del catálogo de ventas.',
+        '¿Los archivo? Responde «sí» para confirmar o «no» para cancelar. Vence en 15 minutos.',
+      ].join('\n');
+      expect(h.sent[0].body).toBe(expectedPreview);
+      expect(h.state().action).toMatchObject({
+        kind: 'archive_batch',
+        status: 'pending',
+      });
+
+      await h.say('de una');
+      expect(writes(h)).toEqual([{
+        ids: [81, 82],
+        vals: { active: false },
+      }]);
+      expect(h.sent[1].body).toBe(
+        '¡Listo! Archivé los 2 productos en Odoo. Quedaron ocultos del catálogo de ventas. ¿Deseas hacer algo más?',
+      );
+      expect(h.state().action).toMatchObject({
+        status: 'created',
+        outcome: { completedProductIds: [81, 82], uncertainProductIds: [] },
+      });
+    });
+
+    it('handles batch rejection by cancelling action and notifying operator with plural messages', async () => {
+      const hCreate = setup([
+        call('create_products', {
+          items: [
+            { name: 'Pioneer 2', salePrice: 45, priceIncludesTax: true },
+            { name: 'Sony Alpha', salePrice: 100, priceIncludesTax: true },
+          ],
+        }),
+        decision('reject'),
+        text('Cancelado'),
+      ]);
+      routeOdoo(hCreate);
+      await hCreate.say('Crea Pioneer 2 y Sony Alpha');
+      await hCreate.say('No, mejor no');
+      expect(creates(hCreate)).toEqual([]);
+      expect(hCreate.state().action?.status).toBe('cancelled');
+      expect(hCreate.sent[1].body).toBe('Listo, no los creé.');
+
+      const hUpdate = setup([
+        call('update_products', {
+          items: [
+            { productId: 81, name: 'Pioneer 3' },
+            { productId: 82, name: 'Sony Beta' },
+          ],
+        }),
+        decision('reject'),
+        text('Cancelado'),
+      ]);
+      const routeUp = routeOdoo(hUpdate);
+      routeUp.products = [
+        { id: 81, name: 'Pioneer 2', default_code: 'DDJ', list_price: 26.09, standard_price: 20, taxes_id: [1], active: true },
+        { id: 82, name: 'Sony Alpha', default_code: false, list_price: 80, standard_price: 50, taxes_id: [1], active: true },
+      ];
+      await hUpdate.say('Actualiza los dos');
+      await hUpdate.say('Cancela');
+      expect(writes(hUpdate)).toEqual([]);
+      expect(hUpdate.state().action?.status).toBe('cancelled');
+      expect(hUpdate.sent[1].body).toBe('Listo, no los actualicé.');
+
+      const hArchive = setup([
+        call('archive_products', {
+          items: [{ productId: 81 }, { productId: 82 }],
+        }),
+        decision('reject'),
+        text('Cancelado'),
+      ]);
+      const routeArch = routeOdoo(hArchive);
+      routeArch.products = [
+        { id: 81, name: 'Pioneer 2', default_code: 'DDJ', list_price: 26.09, standard_price: 20, taxes_id: [1], active: true },
+        { id: 82, name: 'Sony Alpha', default_code: false, list_price: 80, standard_price: 50, taxes_id: [1], active: true },
+      ];
+      await hArchive.say('Archiva 81 y 82');
+      await hArchive.say('No');
+      expect(writes(hArchive)).toEqual([]);
+      expect(hArchive.state().action?.status).toBe('cancelled');
+      expect(hArchive.sent[1].body).toBe('Listo, no los archivé.');
+    });
+
+    it('prompts clarify questions for batch action kinds', async () => {
+      const hCreate = setup([
+        call('create_products', {
+          items: [
+            { name: 'Pioneer 2', salePrice: 45, priceIncludesTax: true },
+            { name: 'Sony Alpha', salePrice: 100, priceIncludesTax: true },
+          ],
+        }),
+        decision('clarify'),
+      ]);
+      routeOdoo(hCreate);
+      await hCreate.say('Crea ambos');
+      await hCreate.say('¿Cuáles eran?');
+      expect(hCreate.sent[1].body).toBe('¿Los creo? Responde «sí» para crearlos o dime qué cambiar.');
+
+      const hUpdate = setup([
+        call('update_products', {
+          items: [
+            { productId: 81, name: 'Pioneer 3' },
+            { productId: 82, name: 'Sony Beta' },
+          ],
+        }),
+        decision('clarify'),
+      ]);
+      const routeUp = routeOdoo(hUpdate);
+      routeUp.products = [
+        { id: 81, name: 'Pioneer 2', default_code: 'DDJ', list_price: 26.09, standard_price: 20, taxes_id: [1], active: true },
+        { id: 82, name: 'Sony Alpha', default_code: false, list_price: 80, standard_price: 50, taxes_id: [1], active: true },
+      ];
+      await hUpdate.say('Actualiza ambos');
+      await hUpdate.say('¿Cómo van a quedar?');
+      expect(hUpdate.sent[1].body).toBe('¿Los actualizo? Responde «sí» o dime qué cambiar.');
+
+      const hArchive = setup([
+        call('archive_products', {
+          items: [{ productId: 81 }, { productId: 82 }],
+        }),
+        decision('clarify'),
+      ]);
+      const routeArch = routeOdoo(hArchive);
+      routeArch.products = [
+        { id: 81, name: 'Pioneer 2', default_code: 'DDJ', list_price: 26.09, standard_price: 20, taxes_id: [1], active: true },
+        { id: 82, name: 'Sony Alpha', default_code: false, list_price: 80, standard_price: 50, taxes_id: [1], active: true },
+      ];
+      await hArchive.say('Archiva ambos');
+      await hArchive.say('¿Se pueden reactivar?');
+      expect(hArchive.sent[1].body).toBe('¿Los archivo? Responde «sí» para confirmar o «no» para cancelar.');
+    });
+
+    it('discards expired batch proposals after 15 minutes', async () => {
+      const h = setup([
+        call('create_products', {
+          items: [
+            { name: 'Pioneer 2', salePrice: 45, priceIncludesTax: true },
+            { name: 'Sony Alpha', salePrice: 100, priceIncludesTax: true },
+          ],
+        }),
+        text('Continuando'),
+      ]);
+      routeOdoo(h);
+      await h.say('Crea ambos');
+      const pending = h.state().action!;
+      expect(pending.status).toBe('pending');
+
+      vi.spyOn(Date, 'now').mockReturnValue(pending.expiresAt + 1000);
+      await h.say('Sí, créalos');
+      expect(h.sent[1].body).toBe(expiredNotice);
+      expect(h.state().action?.status).toBe('cancelled');
+      expect(creates(h)).toEqual([]);
+    });
+
+    it('refuses batch creation when tax validation fails for any item', async () => {
+      const h = setup([
+        call('create_products', {
+          items: [
+            { name: 'Pioneer 2', salePrice: 45, priceIncludesTax: true, taxId: 1 },
+            { name: 'Sony Alpha', salePrice: 100, priceIncludesTax: true, taxId: 999 },
+          ],
+        }),
+        text('IVA no válido'),
+      ]);
+      routeOdoo(h);
+      await h.say('Crea ambos con esos IVAs');
+      expect(h.sent).toEqual([{ to: 'operator', body: taxNotice }]);
+      expect(h.state().action).toBeUndefined();
+      expect(creates(h)).toEqual([]);
+    });
+
+    it('notifies when a product is missing in Odoo during batch update or archive', async () => {
+      const hUpdate = setup([
+        call('update_products', {
+          items: [
+            { productId: 81, name: 'Pioneer 3' },
+            { productId: 999, name: 'Inexistente' },
+          ],
+        }),
+        text('No encontrado'),
+      ]);
+      const routeUp = routeOdoo(hUpdate);
+      routeUp.products = [
+        { id: 81, name: 'Pioneer 2', default_code: 'DDJ', list_price: 26.09, standard_price: 20, taxes_id: [1], active: true },
+      ];
+      await hUpdate.say('Actualiza 81 y 999');
+      expect(hUpdate.sent).toEqual([{ to: 'operator', body: 'No encontré el producto con ID 999 en Odoo.' }]);
+      expect(hUpdate.state().action).toBeUndefined();
+
+      const hArchive = setup([
+        call('archive_products', {
+          items: [{ productId: 81 }, { productId: 999 }],
+        }),
+        text('No encontrado'),
+      ]);
+      const routeArch = routeOdoo(hArchive);
+      routeArch.products = [
+        { id: 81, name: 'Pioneer 2', default_code: 'DDJ', list_price: 26.09, standard_price: 20, taxes_id: [1], active: true },
+      ];
+      await hArchive.say('Archiva 81 y 999');
+      expect(hArchive.sent).toEqual([{ to: 'operator', body: 'No encontré el producto con ID 999 en Odoo.' }]);
+      expect(hArchive.state().action).toBeUndefined();
+    });
+
+    it('includes batch tools and proactive chaining in system prompt instructions', async () => {
+      const h = setup([text('Hola')]);
+      await h.say('Hola');
+      const system = String(h.model.doGenerateCalls[0].prompt[0].content);
+      expect(system).toContain('create_products');
+      expect(system).toContain('update_products');
+      expect(system).toContain('archive_products');
+      expect(system).toContain('pregunta proactivamente si desea continuar con el siguiente paso');
+    });
   });
 });
 
