@@ -11,6 +11,76 @@ const history: ModelMessage[] = [{ role: 'user', content: 'Crea Pioneer' }, { ro
   { type: 'tool-approval-request', approvalId: 'approval-1', toolCallId: 'call-1' },
 ] }];
 
+describe.each(['create_batch', 'update_batch', 'archive_batch'] as const)('durable %s', (kind) => {
+  let store: RelayStore;
+  const items = kind === 'create_batch' ? [{ name: 'First' }, { name: 'Second' }] : kind === 'update_batch'
+    ? [{ productId: 11, currentValues: { name: 'First' }, proposedValues: { reference: 'A' } },
+      { productId: 12, currentValues: { name: 'Second' }, proposedValues: { reference: 'B' } }]
+    : [{ productId: 11, name: 'First' }, { productId: 12, name: 'Second' }];
+  const input = { items: kind === 'create_batch' ? [{ name: 'First' }, { name: 'Second' }] : kind === 'update_batch'
+    ? [{ productId: 11, reference: 'A' }, { productId: 12, reference: 'B' }] : [{ productId: 11 }, { productId: 12 }] };
+  const proposal = { ...target, id: 'batch', kind, items, approvalId: 'approval', toolCallId: 'call',
+    authorityFingerprint: 'fingerprint', expiresAt: 5000 } as ConversationActionProposal;
+  const toolName = kind === 'create_batch' ? 'create_products' : kind === 'update_batch' ? 'update_products' : 'archive_products';
+  const messages = (payload: unknown = input): ModelMessage[] => [{ role: 'assistant', content: [
+    { type: 'tool-call', toolName, toolCallId: 'call', input: payload },
+    { type: 'tool-approval-request', approvalId: 'approval', toolCallId: 'call' },
+  ] }];
+  const reserve = (action = proposal, history = messages()) => store.reserveConversationAction('op', 'phone', 'turn', action, history);
+  const claim = (payload: unknown = input, destination = target, timestamp = 1000, call = 'call') =>
+    store.claimConversationBatch('op', 'phone', 'turn', 'batch', call, payload, destination, timestamp);
+  const state = () => store.getOperatorConversation('op', 'phone');
+  beforeEach(() => {
+    store = new RelayStore(new ConfigService({ RELAY_DB_PATH: ':memory:' }));
+    store.onModuleInit();
+    expect(store.claimConversationTurn('op', 'phone', 'turn')).toBe(true);
+  });
+  afterEach(() => store.onApplicationShutdown());
+  function approve() {
+    expect(reserve()).toBe(true);
+    expect(claim()).toBe(false);
+    expect(store.authorizeConversationAction('op', 'phone', 'turn', 'batch', target, 1000)).toBe(false);
+    expect(store.bindConversationPreview('op', 'phone', 'turn', 'batch', 'visible')).toBe(true);
+    expect(store.authorizeConversationAction('op', 'phone', 'turn', 'batch', target, 1000)).toBe(true);
+  }
+  it('binds ordered native tool payload and rejects bounds, duplicates and altered second items', () => {
+    expect(reserve(proposal, messages({ items: [...input.items].reverse() }))).toBe(false);
+    expect(reserve({ ...proposal, items: items.slice(0, 1) } as ConversationActionProposal)).toBe(false);
+    expect(reserve({ ...proposal, items: Array.from({ length: kind === 'archive_batch' ? 51 : 21 }, () => items[0]) } as ConversationActionProposal)).toBe(false);
+    if (kind !== 'create_batch') expect(reserve({ ...proposal, items: [items[0], items[0]] } as ConversationActionProposal)).toBe(false);
+    approve();
+    const before = state();
+    for (const payload of [{ items: [...input.items].reverse() }, { items: input.items.slice(0, 1) },
+      { items: [input.items[0], { ...input.items[1], unexpected: true }] }, { ...input, extra: true }]) expect(claim(payload)).toBe(false);
+    expect(claim(input, { ...target, companyId: 8 })).toBe(false);
+    expect(claim(input, target, 5000)).toBe(false);
+    expect(claim(input, target, 1000, 'wrong')).toBe(false);
+    expect(state()).toEqual(before);
+    expect(claim()).toBe(true);
+    expect(claim()).toBe(false);
+    expect(store.finishConversationBatch('op', 'phone', 'turn', 'batch', 'created', { completedProductIds: [11], uncertainProductIds: [] })).toBe(false);
+    expect(store.finishConversationBatch('op', 'phone', 'turn', 'batch', 'created', { completedProductIds: [11, 12], uncertainProductIds: [] })).toBe(true);
+    expect(state().action).toMatchObject({ items, status: 'created', outcome: { completedProductIds: [11, 12], uncertainProductIds: [] } });
+    expect(claim()).toBe(false);
+  });
+  it('persists immutable items and unknown partial outcomes, blocking replacement and retries', () => {
+    approve();
+    const snapshot = state();
+    const returned = state().action;
+    if (returned && 'items' in returned) (returned.items as unknown[]).reverse();
+    expect(state()).toEqual(snapshot);
+    expect(store.saveConversationMessages('op', 'phone', 'turn', messages({ items: [...input.items].reverse() }))).toBe(false);
+    expect(claim()).toBe(true);
+    const outcome = { completedProductIds: [11], uncertainProductIds: [12] };
+    expect(store.finishConversationBatch('op', 'phone', 'turn', 'batch', 'unknown', outcome)).toBe(true);
+    outcome.completedProductIds.push(99);
+    expect(state().action).toMatchObject({ status: 'unknown', outcome: { completedProductIds: [11], uncertainProductIds: [12] } });
+    expect(reserve()).toBe(false);
+    expect(claim()).toBe(false);
+    expect(store.finishConversationBatch('op', 'phone', 'turn', 'batch', 'created', { completedProductIds: [11, 12], uncertainProductIds: [] })).toBe(false);
+  });
+});
+
 describe('durable operator conversation public store contract', () => {
   let store: RelayStore;
   const state = () => store.getOperatorConversation('operator', 'business');

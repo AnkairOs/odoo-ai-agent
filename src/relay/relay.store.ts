@@ -73,6 +73,53 @@ export const conversationProductArchiveInputSchema = z.object({
 }).strict();
 export type ConversationProductArchiveInput = z.infer<typeof conversationProductArchiveInputSchema>;
 
+export const conversationCreateBatchItemSchema = newProductSchema.extend({
+  price: conversationPriceSchema.optional(),
+  cost: costSchema.optional(),
+}).strict();
+export type ConversationCreateBatchItem = z.infer<typeof conversationCreateBatchItemSchema>;
+
+export const conversationCreateBatchPayloadSchema = z.object({
+  items: z.array(conversationProductSchema).min(2).max(20),
+}).strict();
+export type ConversationCreateBatchPayload = z.infer<typeof conversationCreateBatchPayloadSchema>;
+
+export const conversationUpdateBatchItemSchema = z.object({
+  productId: conversationProductIdSchema,
+  currentValues: updateCurrentValuesSchema,
+  proposedValues: updateProposedValuesSchema,
+}).strict();
+export type ConversationUpdateBatchItem = z.infer<typeof conversationUpdateBatchItemSchema>;
+
+export const conversationUpdateBatchPayloadSchema = z.object({
+  items: z.array(conversationProductUpdateInputSchema).min(2).max(20).refine(
+    (items) => new Set(items.map((i) => i.productId)).size === items.length,
+    { message: 'Product IDs must be unique' },
+  ),
+}).strict();
+export type ConversationUpdateBatchPayload = z.infer<typeof conversationUpdateBatchPayloadSchema>;
+
+export const conversationArchiveBatchItemSchema = z.object({
+  productId: conversationProductIdSchema,
+  name: z.string().min(1),
+  reference: z.string().optional(),
+}).strict();
+export type ConversationArchiveBatchItem = z.infer<typeof conversationArchiveBatchItemSchema>;
+
+export const conversationArchiveBatchPayloadSchema = z.object({
+  items: z.array(conversationProductArchiveInputSchema).min(2).max(50).refine(
+    (items) => new Set(items.map((i) => i.productId)).size === items.length,
+    { message: 'Product IDs must be unique' },
+  ),
+}).strict();
+export type ConversationArchiveBatchPayload = z.infer<typeof conversationArchiveBatchPayloadSchema>;
+
+export const conversationBatchOutcomeSchema = z.object({
+  completedProductIds: z.array(conversationProductIdSchema),
+  uncertainProductIds: z.array(conversationProductIdSchema),
+}).strict();
+export type ConversationBatchOutcome = z.infer<typeof conversationBatchOutcomeSchema>;
+
 interface ConversationActionBase extends ProductDestination {
   id: string;
   approvalId: string;
@@ -104,15 +151,39 @@ export interface ConversationArchiveAction extends ConversationActionBase {
   reference?: string;
 }
 
+export interface ConversationCreateBatchAction extends ConversationActionBase {
+  kind: 'create_batch';
+  items: ConversationCreateBatchItem[];
+  outcome?: ConversationBatchOutcome;
+}
+
+export interface ConversationUpdateBatchAction extends ConversationActionBase {
+  kind: 'update_batch';
+  items: ConversationUpdateBatchItem[];
+  outcome?: ConversationBatchOutcome;
+}
+
+export interface ConversationArchiveBatchAction extends ConversationActionBase {
+  kind: 'archive_batch';
+  items: ConversationArchiveBatchItem[];
+  outcome?: ConversationBatchOutcome;
+}
+
 export type ConversationAction =
   | ConversationCreateAction
   | ConversationUpdateAction
-  | ConversationArchiveAction;
+  | ConversationArchiveAction
+  | ConversationCreateBatchAction
+  | ConversationUpdateBatchAction
+  | ConversationArchiveBatchAction;
 
 export type ConversationActionProposal =
   | (Omit<ConversationCreateAction, 'status' | 'visibleMessageId' | 'productId'> & { kind?: 'create'; productId?: number })
   | (Omit<ConversationUpdateAction, 'status' | 'visibleMessageId'> & { kind: 'update' })
-  | (Omit<ConversationArchiveAction, 'status' | 'visibleMessageId'> & { kind: 'archive' });
+  | (Omit<ConversationArchiveAction, 'status' | 'visibleMessageId'> & { kind: 'archive' })
+  | (Omit<ConversationCreateBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'create_batch' })
+  | (Omit<ConversationUpdateBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'update_batch' })
+  | (Omit<ConversationArchiveBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'archive_batch' });
 
 export interface OperatorConversation {
   messages: ModelMessage[];
@@ -123,7 +194,21 @@ export interface OperatorConversation {
 export const MAX_CONVERSATION_MESSAGES = 40;
 export const MAX_CONVERSATION_BYTES = 64_000;
 
-const APPROVAL_TOOLS = ['create_product', 'update_product', 'archive_product'] as const;
+const APPROVAL_TOOLS = [
+  'create_product',
+  'update_product',
+  'archive_product',
+  'create_products',
+  'update_products',
+  'archive_products',
+] as const;
+
+function isBatchAction(action: ConversationAction): action is
+  | ConversationCreateBatchAction
+  | ConversationUpdateBatchAction
+  | ConversationArchiveBatchAction {
+  return action.kind === 'create_batch' || action.kind === 'update_batch' || action.kind === 'archive_batch';
+}
 
 function hasApprovalChain(messages: ModelMessage[], approvalId: string, toolCallId: string, toolName?: string): boolean {
   const allowed = toolName ? [toolName] : APPROVAL_TOOLS;
@@ -131,6 +216,83 @@ function hasApprovalChain(messages: ModelMessage[], approvalId: string, toolCall
     message.content.some((part) => part.type === 'tool-approval-request' && part.approvalId === approvalId &&
       part.toolCallId === toolCallId) && message.content.some((part) => part.type === 'tool-call' &&
         part.toolCallId === toolCallId && typeof part.toolName === 'string' && (allowed as readonly string[]).includes(part.toolName)));
+}
+
+function matchesCreateBatchItem(item: ConversationCreateBatchItem, input: ConversationProduct): boolean {
+  return item.name === input.name &&
+    item.reference === input.reference &&
+    item.price?.amount === input.salePrice &&
+    item.price?.includesTax === input.priceIncludesTax &&
+    item.price?.requestedTaxId === input.taxId &&
+    item.cost === input.cost;
+}
+
+function matchesUpdateBatchItem(item: ConversationUpdateBatchItem, input: ConversationProductUpdateInput): boolean {
+  if (item.productId !== input.productId) return false;
+  const proposed = item.proposedValues;
+  if (proposed.name !== input.name) return false;
+  if (proposed.reference !== input.reference) return false;
+  if (proposed.cost !== input.cost) return false;
+  if (proposed.price) {
+    if (proposed.price.amount !== input.salePrice) return false;
+    if (proposed.price.includesTax !== input.priceIncludesTax) return false;
+    if (proposed.price.requestedTaxId !== input.taxId) return false;
+  } else {
+    if (input.salePrice !== undefined || input.priceIncludesTax !== undefined || input.taxId !== undefined) return false;
+  }
+  return true;
+}
+
+function matchesArchiveBatchItem(item: ConversationArchiveBatchItem, input: ConversationProductArchiveInput): boolean {
+  return item.productId === input.productId;
+}
+
+function matchesBatchPayload(
+  action:
+    | { kind: 'create_batch'; items: ConversationCreateBatchItem[] }
+    | { kind: 'update_batch'; items: ConversationUpdateBatchItem[] }
+    | { kind: 'archive_batch'; items: ConversationArchiveBatchItem[] },
+  payload: unknown,
+): boolean {
+  if (action.kind === 'create_batch') {
+    const parsed = conversationCreateBatchPayloadSchema.safeParse(payload);
+    if (!parsed.success || parsed.data.items.length !== action.items.length) return false;
+    return action.items.every((item, i) => matchesCreateBatchItem(item, parsed.data.items[i]));
+  }
+  if (action.kind === 'update_batch') {
+    const parsed = conversationUpdateBatchPayloadSchema.safeParse(payload);
+    if (!parsed.success || parsed.data.items.length !== action.items.length) return false;
+    return action.items.every((item, i) => matchesUpdateBatchItem(item, parsed.data.items[i]));
+  }
+  if (action.kind === 'archive_batch') {
+    const parsed = conversationArchiveBatchPayloadSchema.safeParse(payload);
+    if (!parsed.success || parsed.data.items.length !== action.items.length) return false;
+    return action.items.every((item, i) => matchesArchiveBatchItem(item, parsed.data.items[i]));
+  }
+  return false;
+}
+
+function findToolCallInput(messages: ModelMessage[], toolCallId: string, toolName: string): unknown | undefined {
+  for (const message of messages) {
+    if (message.role === 'assistant' && Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part.type === 'tool-call' && part.toolCallId === toolCallId && part.toolName === toolName) {
+          return part.input;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+function matchesBatchActionHistory(
+  messages: ModelMessage[],
+  action: ConversationCreateBatchAction | ConversationUpdateBatchAction | ConversationArchiveBatchAction,
+): boolean {
+  const toolName = action.kind === 'create_batch' ? 'create_products'
+    : action.kind === 'update_batch' ? 'update_products' : 'archive_products';
+  const input = findToolCallInput(messages, action.toolCallId, toolName);
+  return input !== undefined && matchesBatchPayload(action, input);
 }
 
 function matchesRequest(action: ConversationCreateAction, input: ConversationProduct): boolean {
@@ -385,8 +547,10 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
     const bounded = boundConversation(messages);
     if (!bounded) return false;
     // An unresolved native approval chain must never be partially pruned.
-    if (state.action && ['proposed', 'pending', 'approved', 'creating', 'unknown'].includes(state.action.status) &&
-      !hasApprovalChain(bounded, state.action.approvalId, state.action.toolCallId)) return false;
+    if (state.action && ['proposed', 'pending', 'approved', 'creating', 'unknown'].includes(state.action.status)) {
+      if (!hasApprovalChain(bounded, state.action.approvalId, state.action.toolCallId)) return false;
+      if (isBatchAction(state.action) && !matchesBatchActionHistory(bounded, state.action)) return false;
+    }
     return this.db.prepare(`UPDATE operator_conversations SET messages = ?
       WHERE operator = ? AND business_phone = ? AND busy = ?`)
       .run(JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
@@ -399,6 +563,78 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
       (state.action && !['created', 'cancelled', 'rejected'].includes(state.action.status))) return false;
     const bounded = boundConversation(messages);
     if (!bounded) return false;
+
+    if (action.kind === 'create_batch') {
+      if (!Array.isArray(action.items) || action.items.length < 2 || action.items.length > 20) return false;
+      const parsedItems: ConversationCreateBatchItem[] = [];
+      for (const item of action.items) {
+        const res = conversationCreateBatchItemSchema.safeParse(item);
+        if (!res.success) return false;
+        parsedItems.push(res.data);
+      }
+      if (!hasApprovalChain(bounded, action.approvalId, action.toolCallId, 'create_products')) return false;
+      const input = findToolCallInput(bounded, action.toolCallId, 'create_products');
+      if (input === undefined || !matchesBatchPayload({ kind: 'create_batch', items: parsedItems }, input)) return false;
+      const stored: ConversationCreateBatchAction = {
+        ...action,
+        kind: 'create_batch',
+        items: parsedItems,
+        status: 'proposed',
+      };
+      return this.db.prepare(`UPDATE operator_conversations SET action = ?, messages = ?
+        WHERE operator = ? AND business_phone = ? AND busy = ?`).run(
+          JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
+    }
+
+    if (action.kind === 'update_batch') {
+      if (!Array.isArray(action.items) || action.items.length < 2 || action.items.length > 20) return false;
+      const parsedItems: ConversationUpdateBatchItem[] = [];
+      const ids: number[] = [];
+      for (const item of action.items) {
+        const res = conversationUpdateBatchItemSchema.safeParse(item);
+        if (!res.success) return false;
+        parsedItems.push(res.data);
+        ids.push(res.data.productId);
+      }
+      if (new Set(ids).size !== ids.length) return false;
+      if (!hasApprovalChain(bounded, action.approvalId, action.toolCallId, 'update_products')) return false;
+      const input = findToolCallInput(bounded, action.toolCallId, 'update_products');
+      if (input === undefined || !matchesBatchPayload({ kind: 'update_batch', items: parsedItems }, input)) return false;
+      const stored: ConversationUpdateBatchAction = {
+        ...action,
+        kind: 'update_batch',
+        items: parsedItems,
+        status: 'proposed',
+      };
+      return this.db.prepare(`UPDATE operator_conversations SET action = ?, messages = ?
+        WHERE operator = ? AND business_phone = ? AND busy = ?`).run(
+          JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
+    }
+
+    if (action.kind === 'archive_batch') {
+      if (!Array.isArray(action.items) || action.items.length < 2 || action.items.length > 50) return false;
+      const parsedItems: ConversationArchiveBatchItem[] = [];
+      const ids: number[] = [];
+      for (const item of action.items) {
+        const res = conversationArchiveBatchItemSchema.safeParse(item);
+        if (!res.success) return false;
+        parsedItems.push(res.data);
+        ids.push(res.data.productId);
+      }
+      if (new Set(ids).size !== ids.length) return false;
+      if (!hasApprovalChain(bounded, action.approvalId, action.toolCallId, 'archive_products')) return false;
+      const input = findToolCallInput(bounded, action.toolCallId, 'archive_products');
+      if (input === undefined || !matchesBatchPayload({ kind: 'archive_batch', items: parsedItems }, input)) return false;
+      const stored: ConversationArchiveBatchAction = {
+        ...action,
+        kind: 'archive_batch',
+        items: parsedItems,
+        status: 'proposed',
+      };
+      return this.db.prepare(`UPDATE operator_conversations SET action = ?, messages = ?
+        WHERE operator = ? AND business_phone = ? AND busy = ?`).run(
+          JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
+    }
 
     if (action.kind === 'update') {
       const idParsed = conversationProductIdSchema.safeParse(action.productId);
@@ -503,10 +739,22 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
       sameProductDestination(action, target) ? { ...action, status: 'creating' } : undefined);
   }
 
+  claimConversationBatch(operator: string, businessPhone: string, eventId: string, actionId: string,
+    toolCallId: string, payload: unknown, target: ProductDestination, timestamp: number): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
+      isBatchAction(action) &&
+      action.status === 'approved' &&
+      action.visibleMessageId &&
+      action.expiresAt > timestamp &&
+      action.toolCallId === toolCallId &&
+      sameProductDestination(action, target) &&
+      matchesBatchPayload(action, payload) ? { ...action, status: 'creating' } : undefined);
+  }
+
   finishConversationAction(operator: string, businessPhone: string, eventId: string, actionId: string,
     status: 'created' | 'rejected' | 'unknown', productId?: number): boolean {
     return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) => {
-      if (action.status !== 'creating') return undefined;
+      if (action.status !== 'creating' || isBatchAction(action)) return undefined;
       if (status === 'created') {
         if (action.kind === 'update' || action.kind === 'archive') {
           return { ...action, status };
@@ -531,6 +779,35 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
   finishConversationArchive(operator: string, businessPhone: string, eventId: string, actionId: string,
     status: 'created' | 'rejected' | 'unknown'): boolean {
     return this.finishConversationAction(operator, businessPhone, eventId, actionId, status);
+  }
+
+  finishConversationBatch(operator: string, businessPhone: string, eventId: string, actionId: string,
+    status: 'created' | 'rejected' | 'unknown', outcome: ConversationBatchOutcome): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) => {
+      if (!isBatchAction(action) || action.status !== 'creating') return undefined;
+      const parsedOutcome = conversationBatchOutcomeSchema.safeParse(outcome);
+      if (!parsedOutcome.success) return undefined;
+      const cleanOutcome: ConversationBatchOutcome = {
+        completedProductIds: [...parsedOutcome.data.completedProductIds],
+        uncertainProductIds: [...parsedOutcome.data.uncertainProductIds],
+      };
+      if (status === 'created') {
+        if (cleanOutcome.uncertainProductIds.length !== 0 ||
+          cleanOutcome.completedProductIds.length !== action.items.length) {
+          return undefined;
+        }
+        if (new Set(cleanOutcome.completedProductIds).size !== cleanOutcome.completedProductIds.length) {
+          return undefined;
+        }
+        if (action.kind === 'update_batch' || action.kind === 'archive_batch') {
+          const expectedIds = new Set(action.items.map((item) => item.productId));
+          if (!cleanOutcome.completedProductIds.every((id) => expectedIds.has(id))) {
+            return undefined;
+          }
+        }
+      }
+      return { ...action, status, outcome: cleanOutcome };
+    });
   }
 
   private updateConversationAction(operator: string, businessPhone: string, eventId: string, actionId: string,
