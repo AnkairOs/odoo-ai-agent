@@ -194,6 +194,7 @@ describe('private operator conversation through the real SDK', () => {
       'set_customer_inquiries',
       'get_customer_inquiries_status',
       'draft_customer_reply',
+      'list_open_consultations',
     ]);
     expect(h.model.doGenerateCalls[0].prompt[0]).toMatchObject({ role: 'system', content: expect.stringContaining('search_products:') });
   });
@@ -205,6 +206,7 @@ describe('private operator conversation through the real SDK', () => {
       'set_customer_inquiries',
       'get_customer_inquiries_status',
       'draft_customer_reply',
+      'list_open_consultations',
     ]);
     expect(h.model.doGenerateCalls[0].prompt[0]).toMatchObject({ content: expect.stringContaining('(ninguna operación Odoo disponible)') });
     expect(h.fetchMock).not.toHaveBeenCalled();
@@ -1692,6 +1694,113 @@ describe('priced product creation in the operator conversation', () => {
       expect(system).toContain('draft_customer_reply');
       expect(system).toContain('dile que...');
       expect(system).toContain('respóndele que...');
+    });
+  });
+
+  describe('list open consultations tool and instructions (T1 & T2)', () => {
+    it('calls list_open_consultations when operator asks about pending inquiries and lists open consultations', async () => {
+      const h = setup([
+        call('list_open_consultations', {}, 'list-1'),
+        text(
+          'Tienes 2 consultas pendientes:\n• Consulta #1: Carlos (cust-1) — ¿Precio de Pioneer?\n• Consulta #2: Maria (cust-2) — ¿Tienen audífonos?\nPuedes responder diciendo «Para la consulta #1 dile que...».',
+        ),
+      ]);
+      const id1 = h.store.createConsultation({
+        customerWaId: 'cust-1',
+        customerName: 'Carlos',
+        customerMessageId: 'msg-1',
+        lastCustomerMessageId: 'msg-1',
+        question: '¿Precio de Pioneer?',
+      });
+      h.store.recordNotificationSent(id1, 'notif-1');
+
+      const id2 = h.store.createConsultation({
+        customerWaId: 'cust-2',
+        customerName: 'Maria',
+        customerMessageId: 'msg-2',
+        lastCustomerMessageId: 'msg-2',
+        question: '¿Tienen audífonos?',
+      });
+      h.store.recordNotificationSent(id2, 'notif-2');
+
+      const handled = await h.say('¿Qué consultas tengo pendientes?');
+      expect(handled).toBe(true);
+      expect(h.sent).toEqual([
+        {
+          to: 'operator',
+          body:
+            'Tienes 2 consultas pendientes:\n• Consulta #1: Carlos (cust-1) — ¿Precio de Pioneer?\n• Consulta #2: Maria (cust-2) — ¿Tienen audífonos?\nPuedes responder diciendo «Para la consulta #1 dile que...».',
+        },
+      ]);
+
+      const history = h.state().messages;
+      expect(history.map((m) => m.role)).toEqual(['user', 'assistant', 'tool', 'assistant']);
+      const toolMessage = history.find((m) => m.role === 'tool');
+      expect(JSON.stringify(toolMessage)).toContain('"status":"ok"');
+      expect(JSON.stringify(toolMessage)).toContain('"total":2');
+      expect(JSON.stringify(toolMessage)).toContain('"customerName":"Carlos"');
+      expect(JSON.stringify(toolMessage)).toContain('"customerName":"Maria"');
+    });
+
+    it('responds that there are no pending inquiries when no consultations are open', async () => {
+      const h = setup([
+        call('list_open_consultations', {}, 'list-1'),
+        text('No hay clientes esperando respuesta en este momento.'),
+      ]);
+
+      const handled = await h.say('¿Quién está esperando?');
+      expect(handled).toBe(true);
+      expect(h.sent).toEqual([
+        {
+          to: 'operator',
+          body: 'No hay clientes esperando respuesta en este momento.',
+        },
+      ]);
+
+      const history = h.state().messages;
+      expect(history.map((m) => m.role)).toEqual(['user', 'assistant', 'tool', 'assistant']);
+      const toolMessage = history.find((m) => m.role === 'tool');
+      expect(JSON.stringify(toolMessage)).toContain('"status":"ok"');
+      expect(JSON.stringify(toolMessage)).toContain('"total":0');
+      expect(JSON.stringify(toolMessage)).toContain('"consultations":[]');
+    });
+
+    it('passes limit parameter to getOpenConsultations when specified', async () => {
+      const h = setup([
+        call('list_open_consultations', { limit: 1 }, 'list-limit-1'),
+        text('Consulta #1: Carlos (cust-1) — ¿Precio?'),
+      ]);
+      const id1 = h.store.createConsultation({
+        customerWaId: 'cust-1',
+        customerName: 'Carlos',
+        customerMessageId: 'msg-1',
+        lastCustomerMessageId: 'msg-1',
+        question: '¿Precio?',
+      });
+      h.store.recordNotificationSent(id1, 'notif-1');
+      const id2 = h.store.createConsultation({
+        customerWaId: 'cust-2',
+        customerName: 'Maria',
+        customerMessageId: 'msg-2',
+        lastCustomerMessageId: 'msg-2',
+        question: '¿Stock?',
+      });
+      h.store.recordNotificationSent(id2, 'notif-2');
+
+      const handled = await h.say('Muestra 1 consulta pendiente');
+      expect(handled).toBe(true);
+      const history = h.state().messages;
+      const toolMessage = history.find((m) => m.role === 'tool');
+      expect(JSON.stringify(toolMessage)).toContain('"total":1');
+    });
+
+    it('includes list_open_consultations in system prompt instructions', async () => {
+      const h = setup([text('Hola')]);
+      await h.say('Hola');
+      const system = String(h.model.doGenerateCalls[0].prompt[0].content);
+      expect(system).toContain('list_open_consultations');
+      expect(system).toContain('Si el operador pregunta qué clientes tiene pendientes');
+      expect(system).toContain('no hay clientes esperando respuesta en este momento.');
     });
   });
 });

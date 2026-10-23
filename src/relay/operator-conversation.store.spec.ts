@@ -530,6 +530,85 @@ describe('open consultation queries and status transitions', () => {
     expect(store.getStatus(id)).toBe('replied');
     expect(store.getLatestOpenConsultation()).toBeUndefined();
   });
+
+  it('returns empty array when no open consultations exist', () => {
+    expect(store.getOpenConsultations()).toEqual([]);
+  });
+
+  it('returns multiple open consultations in ascending ID order (oldest first)', () => {
+    const id1 = store.createConsultation({
+      customerWaId: 'cust-1',
+      customerName: 'Carlos',
+      customerMessageId: 'm-1',
+      lastCustomerMessageId: 'm-1',
+      question: '¿Precio de Pioneer?',
+    });
+    store.recordNotificationSent(id1, 'notif-1');
+
+    const id2 = store.createConsultation({
+      customerWaId: 'cust-2',
+      customerMessageId: 'm-2',
+      lastCustomerMessageId: 'm-2',
+      question: '¿Horario de atención?',
+    });
+    expect(store.getStatus(id2)).toBe('notifying');
+
+    const id3 = store.createConsultation({
+      customerWaId: 'cust-3',
+      customerName: 'Maria',
+      customerMessageId: 'm-3',
+      lastCustomerMessageId: 'm-3-last',
+      question: '¿Tienen audífonos?',
+    });
+    store.recordNotificationSent(id3, 'notif-3');
+
+    const id4 = store.createConsultation({
+      customerWaId: 'cust-4',
+      customerName: 'Juan',
+      customerMessageId: 'm-4',
+      lastCustomerMessageId: 'm-4',
+      question: '¿Hacen envíos?',
+    });
+    store.recordNotificationSent(id4, 'notif-4');
+    store.setReplied(id4, 'Sí, a todo el país.');
+
+    const open = store.getOpenConsultations();
+    expect(open).toHaveLength(2);
+    expect(open[0]).toEqual({
+      id: id1,
+      customerWaId: 'cust-1',
+      customerName: 'Carlos',
+      lastCustomerMessageId: 'm-1',
+      question: '¿Precio de Pioneer?',
+      status: 'awaiting_reply',
+    });
+    expect(open[1]).toEqual({
+      id: id3,
+      customerWaId: 'cust-3',
+      customerName: 'Maria',
+      lastCustomerMessageId: 'm-3-last',
+      question: '¿Tienen audífonos?',
+      status: 'awaiting_reply',
+    });
+    expect(open[0].id).toBeLessThan(open[1].id);
+  });
+
+  it('clamps limit between 1 and 50 and respects limits', () => {
+    for (let index = 1; index <= 3; index++) {
+      const id = store.createConsultation({
+        customerWaId: `cust-${index}`,
+        customerMessageId: `m-${index}`,
+        lastCustomerMessageId: `m-${index}`,
+        question: `Pregunta ${index}`,
+      });
+      store.recordNotificationSent(id, `notif-${index}`);
+    }
+
+    expect(store.getOpenConsultations(1)).toHaveLength(1);
+    expect(store.getOpenConsultations(2)).toHaveLength(2);
+    expect(store.getOpenConsultations(0)).toHaveLength(1);
+    expect(store.getOpenConsultations(100)).toHaveLength(3);
+  });
 });
 
 describe('customer inquiries switch persistence', () => {

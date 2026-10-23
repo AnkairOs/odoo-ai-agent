@@ -1020,6 +1020,41 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
     };
   }
 
+  getOpenConsultations(limit = 20): Array<
+    Consultation & {
+      question: string;
+      customerName?: string;
+      lastCustomerMessageId: string;
+    }
+  > {
+    const clampedLimit = Number.isFinite(limit)
+      ? Math.min(50, Math.max(1, Math.trunc(limit)))
+      : 20;
+    const rows = this.db
+      .prepare(
+        `SELECT id, customer_wa_id, customer_name, last_customer_message_id, question, status
+         FROM consultations
+         WHERE status = 'awaiting_reply'
+         ORDER BY id ASC LIMIT ?`,
+      )
+      .all(clampedLimit) as Array<{
+        id: number;
+        customer_wa_id: string;
+        customer_name: string | null;
+        last_customer_message_id: string | null;
+        question: string;
+        status: ConsultationStatus;
+      }>;
+    return rows.map((row) => ({
+      id: row.id,
+      customerWaId: row.customer_wa_id,
+      customerName: row.customer_name ?? undefined,
+      lastCustomerMessageId: row.last_customer_message_id ?? '',
+      question: row.question,
+      status: row.status,
+    }));
+  }
+
   appendQuestion(id: number, text: string, lastCustomerMessageId: string) {
     this.db
       .prepare(
@@ -1068,19 +1103,21 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
 
   customerHistory(
     customerWaId: string,
-    excludedId: number,
+    excludedId?: number,
   ): PastConsultation[] {
-    return this.db
-      .prepare(
-        `SELECT question, reply_text AS reply, created_at AS date FROM consultations
+    const query =
+      excludedId !== undefined
+        ? `SELECT question, reply_text AS reply, created_at AS date FROM consultations
          WHERE customer_wa_id = ? AND id != ?
-         ORDER BY id DESC LIMIT ?`,
-      )
-      .all(
-        customerWaId,
-        excludedId,
-        PAST_RESULTS_LIMIT,
-      ) as unknown as PastConsultation[];
+         ORDER BY id DESC LIMIT ?`
+        : `SELECT question, reply_text AS reply, created_at AS date FROM consultations
+         WHERE customer_wa_id = ?
+         ORDER BY id DESC LIMIT ?`;
+    const params =
+      excludedId !== undefined
+        ? [customerWaId, excludedId, PAST_RESULTS_LIMIT]
+        : [customerWaId, PAST_RESULTS_LIMIT];
+    return this.db.prepare(query).all(...params) as unknown as PastConsultation[];
   }
 
   searchPastAnswers(keywords: string[]): PastAnswer[] {
