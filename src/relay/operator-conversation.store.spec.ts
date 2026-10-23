@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { ConfigService } from '@nestjs/config';
 import type { ModelMessage } from 'ai';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -350,3 +353,53 @@ describe('durable operator conversation public store contract', () => {
     expect(state().action?.status).toBe('cancelled');
   });
 });
+
+describe('customer inquiries switch persistence', () => {
+  it('defaults to true, toggles to false and true', () => {
+    const store = new RelayStore(new ConfigService({ RELAY_DB_PATH: ':memory:' }));
+    store.onModuleInit();
+    try {
+      expect(store.isCustomerInquiriesEnabled()).toBe(true);
+
+      store.setCustomerInquiriesEnabled(false);
+      expect(store.isCustomerInquiriesEnabled()).toBe(false);
+
+      store.setCustomerInquiriesEnabled(true);
+      expect(store.isCustomerInquiriesEnabled()).toBe(true);
+    } finally {
+      store.onApplicationShutdown();
+    }
+  });
+
+  it('persists inquiries enabled switch across store re-instantiations', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'relay-inquiries-'));
+    const dbPath = join(dir, 'relay.sqlite');
+    try {
+      const config = new ConfigService({ RELAY_DB_PATH: dbPath });
+
+      let store = new RelayStore(config);
+      store.onModuleInit();
+      expect(store.isCustomerInquiriesEnabled()).toBe(true);
+
+      store.setCustomerInquiriesEnabled(false);
+      expect(store.isCustomerInquiriesEnabled()).toBe(false);
+      store.onApplicationShutdown();
+
+      store = new RelayStore(config);
+      store.onModuleInit();
+      expect(store.isCustomerInquiriesEnabled()).toBe(false);
+
+      store.setCustomerInquiriesEnabled(true);
+      expect(store.isCustomerInquiriesEnabled()).toBe(true);
+      store.onApplicationShutdown();
+
+      store = new RelayStore(config);
+      store.onModuleInit();
+      expect(store.isCustomerInquiriesEnabled()).toBe(true);
+      store.onApplicationShutdown();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+

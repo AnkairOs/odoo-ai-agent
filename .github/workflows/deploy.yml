@@ -1,0 +1,55 @@
+name: CI and Deploy odoo-ai-agent to Contabo VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Run Tests and Quality Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run full test suite
+        run: npm test
+
+      - name: Compile TypeScript
+        run: npm run build
+
+      - name: Run linter
+        run: npm run lint
+
+  deploy:
+    name: Deploy to VPS via SSH
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to Contabo VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+            echo "🚀 Actualizando odoo-ai-agent en servidor VPS..."
+            cd /opt/odoo-ai-agent
+            git pull origin main
+            docker compose up -d --build
+            docker compose ps
+            echo "✅ odoo-ai-agent desplegado y en ejecución."

@@ -446,6 +446,10 @@ const SCHEMA = `
     updated_at TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS relay_jobs_status ON relay_jobs (status, id);
+  CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
 `;
 
 const OPEN_STATUSES =
@@ -499,6 +503,23 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
 
   onApplicationShutdown() {
     this.db?.close();
+  }
+
+  isCustomerInquiriesEnabled(): boolean {
+    const row = this.db
+      .prepare('SELECT value FROM app_settings WHERE key = ?')
+      .get('customer_inquiries_enabled') as { value: string } | undefined;
+    return row?.value !== 'false';
+  }
+
+  setCustomerInquiriesEnabled(enabled: boolean): void {
+    this.db
+      .prepare(
+        `INSERT INTO app_settings (key, value)
+         VALUES ('customer_inquiries_enabled', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(String(enabled));
   }
 
   markProcessed(messageId: string): boolean {

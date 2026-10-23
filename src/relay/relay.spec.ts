@@ -20,6 +20,7 @@ import { RelayModule } from './relay.module.js';
 import { RelayStore } from './relay.store.js';
 import { RelayService } from './relay.service.js';
 import { ReplySuggester } from './reply-suggester.js';
+import { OdooOperatorService } from '../odoo/odoo-operator.service.js';
 import {
   OutgoingText,
   SendResult,
@@ -1021,6 +1022,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
         ODOO_DEFAULT_URL: 'https://odoo.invalid', ODOO_DEFAULT_DB: 'test', ODOO_DEFAULT_API_KEY: 'fake-key',
       };
       await start();
+      vi.spyOn(OdooOperatorService.prototype, 'resolveOperatorPhone').mockResolvedValue(OPERATOR);
       fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response('[42]'));
       vi.stubGlobal('fetch', fetchMock);
     });
@@ -1867,6 +1869,102 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
           query: 'recargas',
         }),
       ).toEqual([{ question: 'recargas viejas', reply: 'respuesta' }]);
+    });
+  });
+
+  describe('production readiness controls (S1, S2, S3)', () => {
+    it('consumes customer message silently when inquiries are disabled (no job enqueued, no notifications sent)', async () => {
+      const store = app.get(RelayStore);
+      const relay = app.get(RelayService);
+      store.setCustomerInquiriesEnabled(false);
+
+      const customerMsg = {
+        id: 'wamid.CUST_PAUSED_DIRECT',
+        from: CUSTOMER_A,
+        phoneNumberId: BUSINESS_PHONE_ID,
+        type: 'text',
+        text: '¿Tienen entrega hoy?',
+      };
+
+      const consumed = await relay.handle(customerMsg);
+      expect(consumed).toBe(true);
+
+      expect(sender.sent).toEqual([]);
+      expect(store.findOpenForCustomer(CUSTOMER_A)).toBeUndefined();
+      expect(storedJobs()).toEqual([]);
+      expect(ai.toolCalls).toEqual([]);
+      expect(ai.structuredCalls).toEqual([]);
+    });
+
+    it('maintains total silence via webhook when inquiries are disabled', async () => {
+      const store = app.get(RelayStore);
+      store.setCustomerInquiriesEnabled(false);
+
+      await deliver(
+        inbound({
+          id: 'wamid.CUST_PAUSED_WEBHOOK',
+          from: CUSTOMER_A,
+          body: 'Hola, ¿atienden hoy?',
+        }),
+      ).expect(200);
+
+      expect(sender.sent).toEqual([]);
+      expect(store.findOpenForCustomer(CUSTOMER_A)).toBeUndefined();
+      expect(ai.toolCalls).toEqual([]);
+      expect(ai.structuredCalls).toEqual([]);
+    });
+
+    it('creates consultation and queues job normally when inquiries are enabled', async () => {
+      const store = app.get(RelayStore);
+      store.setCustomerInquiriesEnabled(true);
+
+      await deliver(
+        inbound({
+          id: 'wamid.CUST_ACTIVE_NORMAL',
+          from: CUSTOMER_A,
+          name: 'Ana',
+          body: '¿Tienen talla L?',
+        }),
+      ).expect(200);
+
+      expect(store.findOpenForCustomer(CUSTOMER_A)).toBeDefined();
+      expect(sender.to(OPERATOR)).toHaveLength(1);
+      expect(sender.to(OPERATOR)[0].body).toContain('¿Tienen talla L?');
+      expect(storedJobs().some((j) => j.status === 'done')).toBe(true);
+    });
+
+    it('resolves operator phone using OdooOperatorService.resolveOperatorPhone()', async () => {
+      const operatorService = app.get(OdooOperatorService);
+      const dynamicOperator = '593992849536';
+      const resolveSpy = vi
+        .spyOn(operatorService, 'resolveOperatorPhone')
+        .mockResolvedValue(dynamicOperator);
+
+      await deliver(
+        inbound({
+          id: 'wamid.DYNAMIC_OP_CUSTOMER',
+          from: CUSTOMER_A,
+          name: 'Carlos',
+          body: 'Consulta para operador dinámico',
+        }),
+      ).expect(200);
+
+      expect(resolveSpy).toHaveBeenCalled();
+      expect(sender.to(dynamicOperator)).toHaveLength(1);
+      expect(sender.to(dynamicOperator)[0].body).toContain('Consulta para operador dinámico');
+
+      await deliver(
+        inbound({
+          id: 'wamid.DYNAMIC_OP_ANSWER',
+          from: dynamicOperator,
+          body: '/enviar Sí, disponible',
+          contextId: notificationId(sender.to(dynamicOperator)[0]),
+        }),
+      ).expect(200);
+
+      expect(sender.to(CUSTOMER_A)).toEqual([
+        { to: CUSTOMER_A, body: 'Sí, disponible', contextMessageId: 'wamid.DYNAMIC_OP_CUSTOMER' },
+      ]);
     });
   });
 });
