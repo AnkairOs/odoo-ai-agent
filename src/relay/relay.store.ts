@@ -169,13 +169,23 @@ export interface ConversationArchiveBatchAction extends ConversationActionBase {
   outcome?: ConversationBatchOutcome;
 }
 
+export interface ConversationReplyCustomerAction extends ConversationActionBase {
+  kind: 'reply_customer';
+  consultationId: number;
+  customerWaId: string;
+  customerName?: string;
+  replyText: string;
+  lastCustomerMessageId: string;
+}
+
 export type ConversationAction =
   | ConversationCreateAction
   | ConversationUpdateAction
   | ConversationArchiveAction
   | ConversationCreateBatchAction
   | ConversationUpdateBatchAction
-  | ConversationArchiveBatchAction;
+  | ConversationArchiveBatchAction
+  | ConversationReplyCustomerAction;
 
 export type ConversationActionProposal =
   | (Omit<ConversationCreateAction, 'status' | 'visibleMessageId' | 'productId'> & { kind?: 'create'; productId?: number })
@@ -183,7 +193,8 @@ export type ConversationActionProposal =
   | (Omit<ConversationArchiveAction, 'status' | 'visibleMessageId'> & { kind: 'archive' })
   | (Omit<ConversationCreateBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'create_batch' })
   | (Omit<ConversationUpdateBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'update_batch' })
-  | (Omit<ConversationArchiveBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'archive_batch' });
+  | (Omit<ConversationArchiveBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'archive_batch' })
+  | (Omit<ConversationReplyCustomerAction, 'status' | 'visibleMessageId'> & { kind: 'reply_customer' });
 
 export interface OperatorConversation {
   messages: ModelMessage[];
@@ -201,6 +212,7 @@ const APPROVAL_TOOLS = [
   'create_products',
   'update_products',
   'archive_products',
+  'draft_customer_reply',
 ] as const;
 
 function isBatchAction(action: ConversationAction): action is
@@ -695,6 +707,30 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
           JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
     }
 
+    if (action.kind === 'reply_customer') {
+      const consultationIdParsed = z.number().int().positive().safeParse(action.consultationId);
+      const customerWaIdParsed = z.string().trim().min(1).safeParse(action.customerWaId);
+      const customerNameParsed = z.string().trim().min(1).optional().safeParse(action.customerName);
+      const replyTextParsed = z.string().trim().min(1).max(1000).safeParse(action.replyText);
+      const lastCustomerMessageIdParsed = z.string().trim().min(1).safeParse(action.lastCustomerMessageId);
+      if (!consultationIdParsed.success || !customerWaIdParsed.success || !customerNameParsed.success ||
+        !replyTextParsed.success || !lastCustomerMessageIdParsed.success ||
+        !hasApprovalChain(bounded, action.approvalId, action.toolCallId, 'draft_customer_reply')) return false;
+      const stored: ConversationReplyCustomerAction = {
+        ...action,
+        kind: 'reply_customer',
+        consultationId: consultationIdParsed.data,
+        customerWaId: customerWaIdParsed.data,
+        ...(action.customerName !== undefined ? { customerName: action.customerName } : {}),
+        replyText: replyTextParsed.data,
+        lastCustomerMessageId: lastCustomerMessageIdParsed.data,
+        status: 'proposed',
+      };
+      return this.db.prepare(`UPDATE operator_conversations SET action = ?, messages = ?
+        WHERE operator = ? AND business_phone = ? AND busy = ?`).run(
+          JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
+    }
+
     const product = newProductSchema.safeParse({ name: action.name,
       ...(action.reference === undefined ? {} : { reference: action.reference }) });
     const price = conversationPriceSchema.optional().safeParse(action.price);
@@ -772,12 +808,37 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
       matchesBatchPayload(action, payload) ? { ...action, status: 'creating' } : undefined);
   }
 
+  claimConversationAction(
+    operator: string,
+    businessPhone: string,
+    eventId: string,
+    actionId: string,
+    timestamp: number = Date.now(),
+  ): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
+      action.kind === 'reply_customer' &&
+      (action.status === 'pending' || action.status === 'approved') &&
+      action.expiresAt > timestamp
+        ? { ...action, status: 'creating' }
+        : undefined);
+  }
+
+  claimConversationReplyCustomer(
+    operator: string,
+    businessPhone: string,
+    eventId: string,
+    actionId: string,
+    timestamp: number = Date.now(),
+  ): boolean {
+    return this.claimConversationAction(operator, businessPhone, eventId, actionId, timestamp);
+  }
+
   finishConversationAction(operator: string, businessPhone: string, eventId: string, actionId: string,
     status: 'created' | 'rejected' | 'unknown', productId?: number): boolean {
     return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) => {
       if (action.status !== 'creating' || isBatchAction(action)) return undefined;
       if (status === 'created') {
-        if (action.kind === 'update' || action.kind === 'archive') {
+        if (action.kind === 'update' || action.kind === 'archive' || action.kind === 'reply_customer') {
           return { ...action, status };
         }
         if (!Number.isSafeInteger(productId) || productId! <= 0) return undefined;
@@ -908,6 +969,55 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
       )
       .get(customerWaId) as ConsultationRow | undefined;
     return row && toConsultation(row);
+  }
+
+  getLatestOpenConsultation(
+    id?: number,
+  ):
+    | (Consultation & {
+        question: string;
+        customerName?: string;
+        lastCustomerMessageId: string;
+      })
+    | undefined {
+    const row = (
+      id !== undefined
+        ? this.db
+            .prepare(
+              `SELECT id, customer_wa_id, customer_name, last_customer_message_id, question, status
+               FROM consultations
+               WHERE id = ? AND status = 'awaiting_reply'`,
+            )
+            .get(id)
+        : this.db
+            .prepare(
+              `SELECT id, customer_wa_id, customer_name, last_customer_message_id, question, status
+               FROM consultations
+               WHERE status = 'awaiting_reply'
+               ORDER BY id DESC LIMIT 1`,
+            )
+            .get()
+    ) as
+      | {
+          id: number;
+          customer_wa_id: string;
+          customer_name: string | null;
+          last_customer_message_id: string | null;
+          question: string;
+          status: ConsultationStatus;
+        }
+      | undefined;
+    if (!row) {
+      return undefined;
+    }
+    return {
+      id: row.id,
+      customerWaId: row.customer_wa_id,
+      customerName: row.customer_name ?? undefined,
+      lastCustomerMessageId: row.last_customer_message_id ?? '',
+      question: row.question,
+      status: row.status,
+    };
   }
 
   appendQuestion(id: number, text: string, lastCustomerMessageId: string) {
@@ -1061,6 +1171,14 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
         "UPDATE consultations SET status = 'replied', reply_message_id = ?, reply_text = ?, last_error = NULL, updated_at = ? WHERE id = ?",
       )
       .run(replyMessageId, replyText, now(), id);
+  }
+
+  setReplied(id: number, replyText: string, replyMessageId?: string): void {
+    this.db
+      .prepare(
+        "UPDATE consultations SET status = 'replied', reply_message_id = ?, reply_text = ?, last_error = NULL, updated_at = ? WHERE id = ?",
+      )
+      .run(replyMessageId ?? null, replyText, now(), id);
   }
 
   enqueueJob(tenantId: string, messages: InboundMessage[]): number {

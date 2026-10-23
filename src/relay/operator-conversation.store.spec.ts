@@ -352,6 +352,184 @@ describe('durable operator conversation public store contract', () => {
     expect(store.cancelConversationAction('operator', 'business', 'turn-1', validArchive.id)).toBe(true);
     expect(state().action?.status).toBe('cancelled');
   });
+
+  it('reserves, binds, claims, and completes a reply_customer action', () => {
+    const replyProposed: ConversationActionProposal = {
+      kind: 'reply_customer',
+      ...target,
+      id: 'reply-1',
+      consultationId: 4,
+      customerWaId: 'customer-wa-1',
+      customerName: 'Juan',
+      replyText: 'Solo por perfil a 2.25',
+      lastCustomerMessageId: 'wamid.customer-1',
+      toolCallId: 'reply-call-1',
+      approvalId: 'reply-app-1',
+      authorityFingerprint: 'test-fingerprint',
+      expiresAt: 5000,
+    };
+    const replyHistory: ModelMessage[] = [
+      { role: 'user', content: 'Dile que solo por perfil a 2.25' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolName: 'draft_customer_reply',
+            toolCallId: 'reply-call-1',
+            input: { consultationId: 4, replyText: 'Solo por perfil a 2.25' },
+          },
+          { type: 'tool-approval-request', approvalId: 'reply-app-1', toolCallId: 'reply-call-1' },
+        ],
+      },
+    ];
+
+    expect(store.reserveConversationAction('operator', 'business', 'turn-1', replyProposed, replyHistory)).toBe(true);
+    expect(state().action).toMatchObject({
+      kind: 'reply_customer',
+      consultationId: 4,
+      customerWaId: 'customer-wa-1',
+      customerName: 'Juan',
+      replyText: 'Solo por perfil a 2.25',
+      lastCustomerMessageId: 'wamid.customer-1',
+      status: 'proposed',
+    });
+
+    expect(store.bindConversationPreview('operator', 'business', 'turn-1', replyProposed.id, 'visible-reply')).toBe(true);
+    expect(state().action?.status).toBe('pending');
+
+    // Reject claim if expired
+    expect(store.claimConversationAction('operator', 'business', 'turn-1', replyProposed.id, 6000)).toBe(false);
+
+    // Claim succeeds when pending and unexpired
+    expect(store.claimConversationAction('operator', 'business', 'turn-1', replyProposed.id, 1000)).toBe(true);
+    expect(state().action?.status).toBe('creating');
+
+    // Finish action
+    expect(store.finishConversationAction('operator', 'business', 'turn-1', replyProposed.id, 'created')).toBe(true);
+    expect(state().action?.status).toBe('created');
+  });
+
+  it('rejects invalid reply_customer proposal parameters', () => {
+    const invalidReply: ConversationActionProposal = {
+      kind: 'reply_customer',
+      ...target,
+      id: 'reply-inv',
+      consultationId: 0,
+      customerWaId: '',
+      replyText: '',
+      lastCustomerMessageId: '',
+      toolCallId: 'reply-call-inv',
+      approvalId: 'reply-app-inv',
+      authorityFingerprint: 'test-fingerprint',
+      expiresAt: 5000,
+    };
+    const history: ModelMessage[] = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolName: 'draft_customer_reply',
+            toolCallId: 'reply-call-inv',
+            input: { replyText: '' },
+          },
+          { type: 'tool-approval-request', approvalId: 'reply-app-inv', toolCallId: 'reply-call-inv' },
+        ],
+      },
+    ];
+    expect(store.reserveConversationAction('operator', 'business', 'turn-1', invalidReply, history)).toBe(false);
+  });
+});
+
+describe('open consultation queries and status transitions', () => {
+  let store: RelayStore;
+
+  beforeEach(() => {
+    store = new RelayStore(new ConfigService({ RELAY_DB_PATH: ':memory:' }));
+    store.onModuleInit();
+  });
+
+  afterEach(() => {
+    store.onApplicationShutdown();
+  });
+
+  it('returns undefined when no consultations exist', () => {
+    expect(store.getLatestOpenConsultation()).toBeUndefined();
+  });
+
+  it('returns undefined for consultations not awaiting reply', () => {
+    const id = store.createConsultation({
+      customerWaId: 'cust-1',
+      customerMessageId: 'm-1',
+      lastCustomerMessageId: 'm-1',
+      question: '¿Tienen stock?',
+    });
+    // In status 'notifying'
+    expect(store.getStatus(id)).toBe('notifying');
+    expect(store.getLatestOpenConsultation()).toBeUndefined();
+
+    // In status 'notify_failed'
+    store.recordNotificationFailed(id, 'notify_failed', 'err');
+    expect(store.getLatestOpenConsultation()).toBeUndefined();
+  });
+
+  it('returns the latest consultation in awaiting_reply with full details', () => {
+    const id1 = store.createConsultation({
+      customerWaId: 'cust-1',
+      customerName: 'Carlos',
+      customerMessageId: 'm-1',
+      lastCustomerMessageId: 'm-1',
+      question: '¿Precio de Pioneer?',
+    });
+    store.recordNotificationSent(id1, 'notif-1');
+
+    const id2 = store.createConsultation({
+      customerWaId: 'cust-2',
+      customerName: 'Maria',
+      customerMessageId: 'm-2',
+      lastCustomerMessageId: 'm-2-last',
+      question: '¿Tienen audífonos?',
+    });
+    store.recordNotificationSent(id2, 'notif-2');
+
+    const latest = store.getLatestOpenConsultation();
+    expect(latest).toBeDefined();
+    expect(latest).toEqual({
+      id: id2,
+      customerWaId: 'cust-2',
+      customerName: 'Maria',
+      lastCustomerMessageId: 'm-2-last',
+      question: '¿Tienen audífonos?',
+      status: 'awaiting_reply',
+    });
+
+    // Lookup by ID
+    const first = store.getLatestOpenConsultation(id1);
+    expect(first).toEqual({
+      id: id1,
+      customerWaId: 'cust-1',
+      customerName: 'Carlos',
+      lastCustomerMessageId: 'm-1',
+      question: '¿Precio de Pioneer?',
+      status: 'awaiting_reply',
+    });
+  });
+
+  it('updates status and text with setReplied', () => {
+    const id = store.createConsultation({
+      customerWaId: 'cust-1',
+      customerMessageId: 'm-1',
+      lastCustomerMessageId: 'm-1',
+      question: '¿Tienen stock?',
+    });
+    store.recordNotificationSent(id, 'notif-1');
+    expect(store.getLatestOpenConsultation()?.id).toBe(id);
+
+    store.setReplied(id, 'Sí, tenemos disponible.');
+    expect(store.getStatus(id)).toBe('replied');
+    expect(store.getLatestOpenConsultation()).toBeUndefined();
+  });
 });
 
 describe('customer inquiries switch persistence', () => {
