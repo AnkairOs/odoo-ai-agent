@@ -121,6 +121,16 @@ A human-in-the-loop relay with optional private AI drafting and read-only Odoo p
 
 Example: customer asks for 400 Robux → operator quotes the consultation with `Dile que está a $6` → private proposal `La recarga de 400 Robux cuesta $6.` → operator quotes it with `Hazlo más amable` → new private proposal → operator quotes that proposal with `ok` → that exact text reaches the customer once. These are illustrative AI phrases, not guaranteed wording.
 
+**Conversational Customer Reply Dispatch (no quote required).** Alternatively, the operator can reply naturally from the unquoted chat with the copilot. When the operator says *«dile que solo disponemos de 1 perfil a $2.25»* or *«respóndele que...»*, the LLM invokes `draft_customer_reply`, associates the reply with the latest open consultation (or an explicit ID), incorporates real Odoo catalog prices, and presents a confirmation preview:
+```text
+Borrador para el cliente Oscar Joel (...1883) (Consulta #4):
+«Por ahora solo disponemos de opciones de 1 perfil: Disney + premium 1 perfil a $3,00 y Crunchyroll 1 perfil a $2,25.»
+
+¿Lo envío al cliente? Responde «sí» o «ok» para enviarlo. Vence en 15 minutos.
+```
+Responding «sí» or «ok» immediately dispatches the reply to the customer's WhatsApp, quoting their original message, and marks the consultation `replied`. Responding «no» cancels without sending.
+
+
 `/enviar` must be the first exact command token (optional leading whitespace). The command and **one whitespace separator** are removed; all remaining spaces, punctuation and newlines are preserved. `/enviar` with no non-whitespace payload gives private usage guidance. `/enviarme` and embedded `/enviar` are ordinary drafting instructions. Every customer-send route requires a valid quote; there is no unquoted customer-send mode.
 
 Behavior and safeguards:

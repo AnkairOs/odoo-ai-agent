@@ -41,6 +41,7 @@ import {
   type ConversationProductArchiveInput,
   type ConversationProductUpdateInput,
   type ConversationProposedValues,
+  type ConversationReplyCustomerAction,
   type ConversationUpdateAction,
   type ConversationUpdateBatchAction,
   type ConversationUpdateBatchItem,
@@ -88,6 +89,11 @@ const setCustomerInquiriesToolSchema = z.object({
 
 const getCustomerInquiriesStatusToolSchema = z.object({}).strict();
 
+const draftCustomerReplyToolSchema = z.object({
+  consultationId: z.number().int().positive().optional(),
+  replyText: z.string().trim().min(1).max(1000),
+}).strict();
+
 const decisionSchema = z.object({ decision: z.enum(['approve', 'reject', 'clarify', 'change']) }).strict();
 
 type SafeBatchUpdateResult =
@@ -117,11 +123,11 @@ function toSafeBatchUpdateResult(result: ProductBatchUpdateResult): SafeBatchUpd
   };
 }
 const CLASSIFIER_INSTRUCTIONS = [
-  'Clasifica SOLO la respuesta humana nueva ante la propuesta visible (crear, actualizar o archivar uno o varios productos en lote).',
+  'Clasifica SOLO la respuesta humana nueva ante la propuesta visible (crear, actualizar o archivar uno o varios productos en lote, o enviar respuesta a un cliente).',
   'Decide por el sentido, no por palabras exactas. El operador escribe por WhatsApp de forma informal, con faltas de ortografía y sin tildes.',
-  'approve: acepta la acción propuesta (crear, actualizar o archivar, individual o en lote), sin pedir cambios. Ejemplos: «Sí», «si», «Sí, por favor», «si porfavor», «Dale», «Hazlo», «Créalo», «Créalos», «Actualízalo», «Actualízalos», «Archívalo», «Archívalos», «si achvar esta bien», «de una».',
-  'reject: no quiere realizar la acción. Ejemplos: «No», «Cancela», «Mejor no», «Ya no», «No los crees», «No lo archives», «No los archives».',
-  'change: pide modificar nombre, referencia, precio, costo o IVA; nunca aprueba los datos viejos. En archivo, si pide no archivar o cambiar de producto, clasifica según corresponda. Ejemplos: «Sí, pero ponle referencia DDJ» → change; «Cámbiale el nombre a Pioneer 3» → change; «Mejor ponle 50» → change; «Sí, pero sin IVA» → change.',
+  'approve: acepta la acción propuesta (crear, actualizar, archivar o enviar respuesta al cliente), sin pedir cambios. Ejemplos: «Sí», «si», «ok», «OK», «Ok», «dale», «hazlo», «envíalo», «Sí, por favor», «si porfavor», «Dale», «Hazlo», «Créalo», «Créalos», «Actualízalo», «Actualízalos», «Archívalo», «Archívalos», «si achvar esta bien», «de una».',
+  'reject: no quiere realizar la acción. Ejemplos: «No», «Cancela», «Mejor no», «Ya no», «No los crees», «No lo archives», «No los archives», «no lo envíes», «no le digas».',
+  'change: pide modificar nombre, referencia, precio, costo o IVA; nunca aprueba los datos viejos. En respuesta a cliente, pide cambiar el texto o contenido de la respuesta. Ejemplos: «Sí, pero ponle referencia DDJ» → change; «Cámbiale el nombre a Pioneer 3» → change; «Mejor ponle 50» → change; «Sí, pero sin IVA» → change; «Mejor dile que a 3» → change.',
   'clarify: preguntas, dudas, saludos o temas distintos. Ejemplos: «¿Qué precio tendrá?» → clarify; «Hola» → clarify; «déjame pensarlo» → clarify; «¿Qué productos hay?» → clarify.',
   'Nunca apruebes por mensajes anteriores, texto del asistente ni resultados de herramientas.',
   'No extraigas argumentos ni IDs.',
@@ -172,9 +178,17 @@ export class OperatorConversationService {
   private async eligible(message: InboundMessage): Promise<boolean> {
     const operator = (await this.operatorService?.resolveOperatorPhone()) ?? this.config.get<string>('RELAY_OPERATOR_WA_ID');
     const business = this.config.get<string>('KAPSO_PHONE_NUMBER_ID');
-    return !!operator && !!business && message.from === operator && message.phoneNumberId === business &&
-      !message.quotedMessageId && typeof message.text === 'string' && !!message.text.trim() &&
-      !message.text.trimStart().startsWith('/') && message.text.trim().toLowerCase() !== 'ok';
+    if (!operator || !business || message.from !== operator || message.phoneNumberId !== business ||
+      message.quotedMessageId || typeof message.text !== 'string' || !message.text.trim() ||
+      message.text.trimStart().startsWith('/')) {
+      return false;
+    }
+    const isOk = message.text.trim().toLowerCase() === 'ok';
+    if (isOk) {
+      const action = this.store.getOperatorConversation(operator, business).action;
+      return action?.kind === 'reply_customer' && ['proposed', 'pending'].includes(action.status);
+    }
+    return true;
   }
 
   private async turn(message: InboundMessage): Promise<void> {
@@ -196,6 +210,24 @@ export class OperatorConversationService {
       if (decision === 'clarify') {
         await this.notice(message.from, askForAction(action));
         return;
+      }
+      if (action.kind === 'reply_customer') {
+        if (decision === 'approve') {
+          if (!this.store.claimConversationAction(message.from, message.phoneNumberId, message.id, action.id)) {
+            await this.notice(message.from, BLOCKED);
+            return;
+          }
+          await this.dispatchCustomerReply(action);
+          this.store.setReplied(action.consultationId, action.replyText);
+          this.store.finishConversationAction(message.from, message.phoneNumberId, message.id, action.id, 'created');
+          await this.notice(message.from, '¡Listo! Mensaje enviado al cliente.');
+          return;
+        }
+        if (decision === 'reject') {
+          this.store.cancelConversationAction(message.from, message.phoneNumberId, message.id, action.id);
+          await this.notice(message.from, 'Listo, no lo envié.');
+          return;
+        }
       }
       const approve = decision === 'approve';
       const target = this.creation.destination();
@@ -220,7 +252,9 @@ export class OperatorConversationService {
   }
 
   private async discardExpiredProposal(message: InboundMessage, action: ConversationAction, history: ModelMessage[]): Promise<void> {
-    const approval: ConversationApproval = action.kind === 'update'
+    const approval: ConversationApproval = action.kind === 'reply_customer'
+      ? { approvalId: action.approvalId, toolCallId: action.toolCallId, toolName: 'draft_customer_reply', input: { replyText: action.replyText, consultationId: action.consultationId } }
+      : action.kind === 'update'
       ? { approvalId: action.approvalId, toolCallId: action.toolCallId, toolName: 'update_product', input: { productId: action.productId, ...action.proposedValues } }
       : action.kind === 'archive'
       ? { approvalId: action.approvalId, toolCallId: action.toolCallId, toolName: 'archive_product', input: { productId: action.productId } }
@@ -239,6 +273,10 @@ export class OperatorConversationService {
   }
 
   private isConfirmable(action: ConversationAction): boolean {
+    if (action.kind === 'reply_customer') {
+      return action.status === 'pending' && !!action.visibleMessageId && action.expiresAt > Date.now() &&
+        action.authorityFingerprint === this.authorityFingerprint();
+    }
     const target = this.creation.destination();
     return action.status === 'pending' && !!action.visibleMessageId && action.expiresAt > Date.now() &&
       !!target && sameProductDestination(action, target) && action.authorityFingerprint === this.authorityFingerprint();
@@ -279,6 +317,14 @@ export class OperatorConversationService {
         url: action.url,
         db: action.db,
       };
+    } else if (action.kind === 'reply_customer') {
+      proposalData = {
+        kind: 'reply_customer',
+        consultationId: action.consultationId,
+        customerWaId: action.customerWaId,
+        customerName: action.customerName,
+        replyText: action.replyText,
+      };
     } else {
       proposalData = {
         kind: 'create',
@@ -315,6 +361,7 @@ export class OperatorConversationService {
             'create_products',
             'update_products',
             'archive_products',
+            'draft_customer_reply',
           ]
         : ['create_product', 'update_product', 'archive_product'],
       maxSteps: 4,
@@ -423,6 +470,27 @@ export class OperatorConversationService {
       description: 'Consultar el estado actual del interruptor de consultas de clientes (activo o pausado).',
       inputSchema: getCustomerInquiriesStatusToolSchema,
       execute: async () => ({ status: 'ok', enabled: this.store.isCustomerInquiriesEnabled() }),
+    });
+    tools.draft_customer_reply = defineAiTool({
+      description:
+        'Proponer un borrador de respuesta para un cliente con consulta abierta. Usar cuando el operador dé instrucciones sobre qué responder a un cliente (ej. «dile que...», «respóndele que...», «no puedes decirle que...»). Genera vista previa y pide confirmación («sí» u «ok») para enviarlo.',
+      inputSchema: draftCustomerReplyToolSchema,
+      execute: async (input) => {
+        const consultation = input.consultationId !== undefined
+          ? this.store.getLatestOpenConsultation(input.consultationId)
+          : this.store.getLatestOpenConsultation();
+        if (!consultation) {
+          return { status: 'no_open_consultation' };
+        }
+        return {
+          status: 'ok',
+          consultationId: consultation.id,
+          customerWaId: consultation.customerWaId,
+          customerName: consultation.customerName,
+          replyText: input.replyText,
+          lastCustomerMessageId: consultation.lastCustomerMessageId,
+        };
+      },
     });
     return tools;
   }
@@ -788,8 +856,59 @@ export class OperatorConversationService {
 
   private async propose(message: InboundMessage, history: ModelMessage[], approvals: ConversationApproval[]): Promise<void> {
     const approval = approvals[0];
+    if (approvals.length !== 1 || !(await this.eligible(message))) {
+      this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
+      await this.notice(message.from, BATCH_SUPPORTED);
+      return;
+    }
+
+    if (approval.toolName === 'draft_customer_reply') {
+      const parsed = draftCustomerReplyToolSchema.safeParse(approval.input);
+      if (!parsed.success) {
+        this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
+        await this.notice(message.from, UNAVAILABLE);
+        return;
+      }
+      const consultation = parsed.data.consultationId !== undefined
+        ? this.store.getLatestOpenConsultation(parsed.data.consultationId)
+        : this.store.getLatestOpenConsultation();
+      if (!consultation) {
+        this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
+        await this.notice(message.from, 'No hay ninguna consulta abierta de cliente para responder.');
+        return;
+      }
+      const target = this.creation.destination() ?? { url: '', db: '', companyId: 0 };
+      const action: ConversationReplyCustomerAction = {
+        ...target,
+        kind: 'reply_customer',
+        id: randomUUID(),
+        approvalId: approval.approvalId,
+        toolCallId: approval.toolCallId,
+        authorityFingerprint: this.authorityFingerprint(),
+        expiresAt: Date.now() + 15 * 60_000,
+        status: 'proposed',
+        consultationId: consultation.id,
+        customerWaId: consultation.customerWaId,
+        customerName: consultation.customerName,
+        replyText: parsed.data.replyText,
+        lastCustomerMessageId: consultation.lastCustomerMessageId,
+      };
+      if (!this.store.reserveConversationAction(message.from, message.phoneNumberId, message.id, action, history)) {
+        await this.notice(message.from, BLOCKED);
+        return;
+      }
+      const preview = renderCustomerReplyPreview(action);
+      try {
+        const sent = await this.sender.sendText({ to: message.from, body: preview });
+        if (sent.kind === 'sent') {
+          this.store.bindConversationPreview(message.from, message.phoneNumberId, message.id, action.id, sent.messageId);
+        }
+      } catch { /* An unconfirmed delivery never enables approval. */ }
+      return;
+    }
+
     const target = this.creation.destination();
-    if (approvals.length !== 1 || !target || !(await this.eligible(message))) {
+    if (!target) {
       this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
       await this.notice(message.from, BATCH_SUPPORTED);
       return;
@@ -1187,6 +1306,9 @@ export class OperatorConversationService {
     }
     const action = this.store.getOperatorConversation(message.from, message.phoneNumberId).action;
     if (action?.status === 'created') {
+      if (action.kind === 'reply_customer') {
+        return '¡Listo! Mensaje enviado al cliente.';
+      }
       if (action.kind === 'update') {
         const name = action.proposedValues.name ?? action.currentValues.name;
         return `Listo ✅ Actualicé «${name}» en Odoo (ID ${action.productId}).`;
@@ -1228,6 +1350,24 @@ export class OperatorConversationService {
     return undefined;
   }
 
+  private async dispatchCustomerReply(action: ConversationReplyCustomerAction): Promise<void> {
+    const sender = this.sender as unknown as {
+      sendMessage?: (to: string, text: string, options?: { quotedMessageId?: string }) => Promise<unknown>;
+      sendText: (msg: { to: string; body: string; contextMessageId?: string }) => Promise<unknown>;
+    };
+    if (typeof sender.sendMessage === 'function') {
+      await sender.sendMessage(action.customerWaId, action.replyText, {
+        quotedMessageId: action.lastCustomerMessageId,
+      });
+      return;
+    }
+    await sender.sendText({
+      to: action.customerWaId,
+      body: action.replyText,
+      contextMessageId: action.lastCustomerMessageId,
+    });
+  }
+
   private async notice(to: string, body: string): Promise<void> {
     try { await this.sender.sendText({ to, body }); } catch { /* Delivery cannot change a durable creation outcome. */ }
   }
@@ -1235,11 +1375,11 @@ export class OperatorConversationService {
 
 function instructions(tools: AiToolSet): string {
   const odooCapabilities = Object.entries(tools)
-    .filter(([name]) => !['set_customer_inquiries', 'get_customer_inquiries_status'].includes(name))
+    .filter(([name]) => !['set_customer_inquiries', 'get_customer_inquiries_status', 'draft_customer_reply'].includes(name))
     .map(([name, tool]) => `${name}: ${tool.description}`)
     .join('\n');
   const controlCapabilities = Object.entries(tools)
-    .filter(([name]) => ['set_customer_inquiries', 'get_customer_inquiries_status'].includes(name))
+    .filter(([name]) => ['set_customer_inquiries', 'get_customer_inquiries_status', 'draft_customer_reply'].includes(name))
     .map(([name, tool]) => `${name}: ${tool.description}`)
     .join('\n');
   const capabilities = [controlCapabilities, odooCapabilities || '(ninguna operación Odoo disponible)']
@@ -1252,7 +1392,8 @@ function instructions(tools: AiToolSet): string {
     'Nunca menciones nombres de herramientas, pasos internos, IDs internos, códigos técnicos de tipo ni configuración.',
     'Decide tú cuándo responder, preguntar o usar herramientas; puedes consultar varias veces. Herramientas disponibles:',
     capabilities || '(ninguna operación Odoo disponible)',
-    'No tienes otras operaciones. Ofrece solo lo que esas herramientas permiten: pausar o reanudar consultas de clientes, consultar el estado de consultas de clientes, buscar productos, proponer crear un nuevo producto o varios en lote (2 a 20 productos), actualizar campos de productos existentes individualmente o en lote (2 a 20 productos) o archivarlos (individual o en lote de 2 a 50 productos). Nunca ofrezcas editar productos o añadir referencias a productos existentes fuera de las herramientas de actualización y archivo, ni cambiar stock o imágenes, ni borrar definitivamente. Nunca prometas pedidos ni compras.',
+    'No tienes otras operaciones. Ofrece solo lo que esas herramientas permiten: pausar o reanudar consultas de clientes, consultar el estado de consultas de clientes, proponer borrador de respuesta para consultas abiertas de clientes, buscar productos, proponer crear un nuevo producto o varios en lote (2 a 20 productos), actualizar campos de productos existentes individualmente o en lote (2 a 20 productos) o archivarlos (individual o en lote de 2 a 50 productos). Nunca ofrezcas editar productos o añadir referencias a productos existentes fuera de las herramientas de actualización y archivo, ni cambiar stock o imágenes, ni borrar definitivamente. Nunca prometas pedidos ni compras.',
+    'Cuando el operador dé instrucciones sobre qué responder a un cliente (ej. «dile que...», «respóndele que...», «no puedes decirle que...»), incorpora cualquier dato o precio aplicable del catálogo y llama a draft_customer_reply. La herramienta prepara la vista previa y solicita confirmación («sí» u «ok»). Nunca afirmes que el mensaje ya fue enviado antes de la confirmación del operador.',
     'Si el operador pide pausar, detener o silenciar la recepción de mensajes o consultas de clientes, o reanudarlas o reactivarlas en lenguaje natural, invoca la herramienta set_customer_inquiries con enabled=false o enabled=true según corresponda. Responde de forma cercana y concisa en español confirmando el nuevo estado (por ejemplo, «Listo, pausé las consultas de clientes...» o «Listo, reactivé las consultas de clientes...»).',
     'Si el operador pregunta si las consultas están activas o pausadas, usa get_customer_inquiries_status e infórmale de forma concisa.',
     'Si el operador pregunta qué productos hay o pide ver el catálogo general, usa search_products sin query. Menciona el total de productos y lista los devueltos con su precio de venta.',
@@ -1329,6 +1470,7 @@ function creationInput(action: ConversationCreateAction): ProductCreation {
 }
 
 function askForAction(action: ConversationAction): string {
+  if (action.kind === 'reply_customer') return '¿Envío la respuesta al cliente? Responde «sí» o «ok» para enviarla o «no» para cancelar.';
   if (action.kind === 'update') return '¿Lo actualizo? Responde «sí» para actualizarlo o dime qué cambiar.';
   if (action.kind === 'archive') return '¿Lo archivo? Responde «sí» para archivarlo o «no» para cancelar.';
   if (action.kind === 'create_batch') return '¿Los creo? Responde «sí» para crearlos o dime qué cambiar.';
@@ -1338,12 +1480,22 @@ function askForAction(action: ConversationAction): string {
 }
 
 function cancelledNotice(action?: ConversationAction): string {
+  if (action?.kind === 'reply_customer') return 'Listo, no lo envié.';
   if (action?.kind === 'update') return 'Listo, no lo actualicé.';
   if (action?.kind === 'archive') return 'Listo, no lo archivé.';
   if (action?.kind === 'create_batch') return 'Listo, no los creé.';
   if (action?.kind === 'update_batch') return 'Listo, no los actualicé.';
   if (action?.kind === 'archive_batch') return 'Listo, no los archivé.';
   return CANCELLED;
+}
+
+function renderCustomerReplyPreview(action: {
+  customerName?: string;
+  customerWaId: string;
+  consultationId: number;
+  replyText: string;
+}): string {
+  return `Borrador para el cliente ${action.customerName ? action.customerName + ' ' : ''}(${action.customerWaId}) (Consulta #${action.consultationId}):\n«${action.replyText}»\n\n¿Lo envío al cliente? Responde «sí» o «ok» para enviarlo. Vence en 15 minutos.`;
 }
 
 function renderUpdatePreview(action: ConversationUpdateAction, currentTax?: { percent: number }): string {
