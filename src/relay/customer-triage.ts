@@ -19,12 +19,13 @@ const TriageSchema = z.object({
 
 const SYSTEM_PROMPT = `You triage WhatsApp messages that customers send to a small business.
 Classify the customer's latest message:
-- "social_closing": ONLY pure thanks, acknowledgements, greetings that close a chat or goodbyes ("gracias", "ok", "listo", "👍", "chao") with no request, question or new information.
-- "question": any request, question, order, complaint or information the business must read.
+- "social_closing": ONLY explicit, standalone goodbyes or pure thanks after a completed interaction ("muchas gracias", "hasta luego", "chao", "que tenga buen día").
+CRITICAL RULE: NEVER classify affirmations, acceptances, purchase intent, or short answers ("sí", "si", "claro", "me sirve", "dale", "de acuerdo", "quiero", "ok envíeme", "listo pásame la cuenta") as social_closing; these are critical commercial answers and MUST be classified as "question" so the business operator can close the sale.
+- "question": any request, question, purchase interest, confirmation, acceptance of an offer ("sí", "me sirve"), complaint or information the business operator must read.
 - "other": anything else.
+When in doubt, always classify as "question".
 Return JSON: {"category": ..., "confidence": 0..1, "reply": ...}.
-For "social_closing", "reply" is one short friendly sentence in the customer's language, without numbers, prices, dates or promises. Otherwise "reply" is "".
-When unsure, use "question".`;
+For "social_closing", "reply" is one short friendly sentence in the customer's language, without numbers, prices, dates or promises. Otherwise "reply" is "".`;
 
 @Injectable()
 export class CustomerTriage {
@@ -32,16 +33,22 @@ export class CustomerTriage {
 
   constructor(private readonly ai: AiService) {}
 
-  async decide(customerText: string): Promise<TriageDecision> {
+  async decide(
+    customerText: string,
+    priorContext?: string,
+  ): Promise<TriageDecision> {
     if (
       !this.ai.isEnabled() ||
       customerText.trim().length > MAX_TRIAGE_LENGTH
     ) {
       return { kind: 'consult' };
     }
+    const contextPrompt = priorContext?.trim()
+      ? `Prior conversation context (last message sent by the business to the customer):\n"${priorContext.trim()}"\n\nCustomer's latest incoming message:\n"${customerText.trim()}"`
+      : customerText;
     const result = await this.ai.generateStructured({
       system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: customerText }],
+      messages: [{ role: 'user', content: contextPrompt }],
       schema: TriageSchema,
     });
     if (!result.ok) {

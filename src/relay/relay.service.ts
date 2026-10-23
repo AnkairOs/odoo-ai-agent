@@ -137,7 +137,9 @@ export class RelayService {
     customerWaId: string,
     text: string,
   ): Promise<boolean> {
-    const decision = await this.triage.decide(text);
+    const history = this.store.customerHistory(customerWaId);
+    const lastReply = history.find((h) => !!h.reply?.trim())?.reply ?? undefined;
+    const decision = await this.triage.decide(text, lastReply);
     if (decision.kind !== 'auto_reply') {
       return false;
     }
