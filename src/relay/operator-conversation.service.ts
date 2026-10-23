@@ -353,17 +353,19 @@ export class OperatorConversationService {
     const tools = this.tools(message);
     const result = await this.ai.generateConversation({
       system: instructions(tools), messages, tools,
-      approvalRequiredTools: this.creation.destination()
-        ? [
-            'create_product',
-            'update_product',
-            'archive_product',
-            'create_products',
-            'update_products',
-            'archive_products',
-            'draft_customer_reply',
-          ]
-        : ['create_product', 'update_product', 'archive_product'],
+      approvalRequiredTools: [
+        'draft_customer_reply',
+        ...(this.creation.destination()
+          ? [
+              'create_product',
+              'update_product',
+              'archive_product',
+              'create_products',
+              'update_products',
+              'archive_products',
+            ]
+          : ['create_product', 'update_product', 'archive_product']),
+      ],
       maxSteps: 4,
     });
     const outcome = beforeAction?.status === 'approved' ? this.recordedOutcome(message) : undefined;
