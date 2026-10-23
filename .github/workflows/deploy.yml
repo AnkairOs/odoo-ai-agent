@@ -50,6 +50,7 @@ jobs:
             echo "🚀 Actualizando odoo-ai-agent en servidor VPS..."
             cd /opt/odoo-ai-agent
             git pull origin main
-            docker compose up -d --build
+            docker compose down || true
+            docker compose up -d --build --remove-orphans
             docker compose ps
             echo "✅ odoo-ai-agent desplegado y en ejecución."
