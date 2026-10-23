@@ -193,6 +193,7 @@ describe('private operator conversation through the real SDK', () => {
       'archive_products',
       'set_customer_inquiries',
       'get_customer_inquiries_status',
+      'draft_customer_reply',
     ]);
     expect(h.model.doGenerateCalls[0].prompt[0]).toMatchObject({ role: 'system', content: expect.stringContaining('search_products:') });
   });
@@ -203,6 +204,7 @@ describe('private operator conversation through the real SDK', () => {
     expect(h.model.doGenerateCalls[0].tools?.map((tool) => tool.name) ?? []).toEqual([
       'set_customer_inquiries',
       'get_customer_inquiries_status',
+      'draft_customer_reply',
     ]);
     expect(h.model.doGenerateCalls[0].prompt[0]).toMatchObject({ content: expect.stringContaining('(ninguna operación Odoo disponible)') });
     expect(h.fetchMock).not.toHaveBeenCalled();
@@ -1529,6 +1531,167 @@ describe('priced product creation in the operator conversation', () => {
       expect(system).toContain('pausar, detener o silenciar la recepción de mensajes o consultas de clientes');
       expect(system).toContain('Listo, pausé las consultas de clientes');
       expect(system).toContain('Listo, reactivé las consultas de clientes');
+    });
+  });
+
+  describe('conversational customer reply dispatch (T1 & T2)', () => {
+    it('proposes draft customer reply when operator says "dile que...", reserves action and sends preview', async () => {
+      const h = setup([
+        call('draft_customer_reply', { replyText: 'Solo por perfil a 2.25' }, 'draft-1'),
+      ]);
+      const consultationId = h.store.createConsultation({
+        customerWaId: 'customer-wa-4',
+        customerName: 'Santiago',
+        customerMessageId: 'wamid.cust-msg-4',
+        lastCustomerMessageId: 'wamid.cust-last-4',
+        question: '¿Tienen cuentas completas o solo perfiles?',
+      });
+      h.store.recordNotificationSent(consultationId, 'wamid.notif-4');
+
+      const handled = await h.say('dile que solo por perfil a 2.25');
+      expect(handled).toBe(true);
+
+      const expectedPreview =
+        'Borrador para el cliente Santiago (customer-wa-4) (Consulta #' +
+        consultationId +
+        '):\n«Solo por perfil a 2.25»\n\n¿Lo envío al cliente? Responde «sí» o «ok» para enviarlo. Vence en 15 minutos.';
+      expect(h.sent).toEqual([{ to: 'operator', body: expectedPreview }]);
+
+      const action = h.state().action;
+      expect(action).toBeDefined();
+      expect(action).toMatchObject({
+        kind: 'reply_customer',
+        consultationId,
+        customerWaId: 'customer-wa-4',
+        customerName: 'Santiago',
+        replyText: 'Solo por perfil a 2.25',
+        lastCustomerMessageId: 'wamid.cust-last-4',
+        status: 'pending',
+      });
+    });
+
+    it('sends customer reply on operator approval "ok", updates consultation status to replied and confirms', async () => {
+      const h = setup([
+        call('draft_customer_reply', { replyText: 'Solo por perfil a 2.25' }, 'draft-1'),
+        decision('approve'),
+      ]);
+      const consultationId = h.store.createConsultation({
+        customerWaId: 'customer-wa-4',
+        customerName: 'Santiago',
+        customerMessageId: 'wamid.cust-msg-4',
+        lastCustomerMessageId: 'wamid.cust-last-4',
+        question: '¿Tienen cuentas completas o solo perfiles?',
+      });
+      h.store.recordNotificationSent(consultationId, 'wamid.notif-4');
+
+      await h.say('dile que solo por perfil a 2.25');
+      expect(h.state().action?.status).toBe('pending');
+
+      const approved = await h.say('ok');
+      expect(approved).toBe(true);
+
+      expect(h.sent).toEqual([
+        {
+          to: 'operator',
+          body:
+            'Borrador para el cliente Santiago (customer-wa-4) (Consulta #' +
+            consultationId +
+            '):\n«Solo por perfil a 2.25»\n\n¿Lo envío al cliente? Responde «sí» o «ok» para enviarlo. Vence en 15 minutos.',
+        },
+        {
+          to: 'customer-wa-4',
+          body: 'Solo por perfil a 2.25',
+          contextMessageId: 'wamid.cust-last-4',
+        },
+        {
+          to: 'operator',
+          body: '¡Listo! Mensaje enviado al cliente.',
+        },
+      ]);
+
+      expect(h.store.getStatus(consultationId)).toBe('replied');
+      expect(h.state().action?.status).toBe('created');
+    });
+
+    it('sends customer reply on operator approval "sí"', async () => {
+      const h = setup([
+        call('draft_customer_reply', { replyText: 'Disponible en 5 dólares' }, 'draft-2'),
+        decision('approve'),
+      ]);
+      const consultationId = h.store.createConsultation({
+        customerWaId: 'customer-wa-5',
+        customerMessageId: 'wamid.cust-msg-5',
+        lastCustomerMessageId: 'wamid.cust-last-5',
+        question: '¿Cuánto cuesta?',
+      });
+      h.store.recordNotificationSent(consultationId, 'wamid.notif-5');
+
+      await h.say('respóndele que disponible en 5 dólares');
+      expect(h.state().action?.status).toBe('pending');
+
+      const approved = await h.say('sí');
+      expect(approved).toBe(true);
+
+      expect(h.sent[1]).toEqual({
+        to: 'customer-wa-5',
+        body: 'Disponible en 5 dólares',
+        contextMessageId: 'wamid.cust-last-5',
+      });
+      expect(h.sent[2]).toEqual({
+        to: 'operator',
+        body: '¡Listo! Mensaje enviado al cliente.',
+      });
+      expect(h.store.getStatus(consultationId)).toBe('replied');
+      expect(h.state().action?.status).toBe('created');
+    });
+
+    it('cancels action when operator rejects with "no"', async () => {
+      const h = setup([
+        call('draft_customer_reply', { replyText: 'Solo por perfil a 2.25' }, 'draft-1'),
+        decision('reject'),
+      ]);
+      const consultationId = h.store.createConsultation({
+        customerWaId: 'customer-wa-4',
+        customerMessageId: 'wamid.cust-msg-4',
+        lastCustomerMessageId: 'wamid.cust-last-4',
+        question: '¿Tienen cuentas completas o solo perfiles?',
+      });
+      h.store.recordNotificationSent(consultationId, 'wamid.notif-4');
+
+      await h.say('dile que solo por perfil a 2.25');
+      expect(h.state().action?.status).toBe('pending');
+
+      const rejected = await h.say('no');
+      expect(rejected).toBe(true);
+
+      expect(h.sent[1]).toEqual({
+        to: 'operator',
+        body: 'Listo, no lo envié.',
+      });
+      expect(h.store.getStatus(consultationId)).toBe('awaiting_reply');
+      expect(h.state().action?.status).toBe('cancelled');
+    });
+
+    it('gives graceful notice when there is no open consultation', async () => {
+      const h = setup([
+        call('draft_customer_reply', { replyText: 'Solo por perfil a 2.25' }, 'draft-1'),
+      ]);
+
+      const handled = await h.say('dile que solo por perfil a 2.25');
+      expect(handled).toBe(true);
+      expect(h.sent).toEqual([
+        { to: 'operator', body: 'No hay ninguna consulta abierta de cliente para responder.' },
+      ]);
+      expect(h.state().action).toBeUndefined();
+    });
+
+    it('includes draft_customer_reply in system prompt instructions', async () => {
+      const h = setup([text('Hola')]);
+      await h.say('Hola');
+      const system = String(h.model.doGenerateCalls[0].prompt[0].content);
+      expect(system).toContain('draft_customer_reply');
+      expect(system).toContain('dile que...');
+      expect(system).toContain('respóndele que...');
     });
   });
 });
