@@ -473,12 +473,15 @@ export class OperatorConversationService {
     });
     tools.draft_customer_reply = defineAiTool({
       description:
-        'Proponer un borrador de respuesta para un cliente con consulta abierta. Usar cuando el operador dé instrucciones sobre qué responder a un cliente (ej. «dile que...», «respóndele que...», «no puedes decirle que...»). Genera vista previa y pide confirmación («sí» u «ok») para enviarlo.',
+        'Proponer un borrador de respuesta para un cliente con consulta abierta. Usar cuando el operador dé instrucciones sobre qué responder a un cliente (ej. «dile que...», «respóndele que...», «no puedes decirle que...»). Omite consultationId salvo que el operador indique un número explícito. Genera vista previa y pide confirmación («sí» u «ok») para enviarlo.',
       inputSchema: draftCustomerReplyToolSchema,
       execute: async (input) => {
-        const consultation = input.consultationId !== undefined
+        let consultation = input.consultationId !== undefined
           ? this.store.getLatestOpenConsultation(input.consultationId)
-          : this.store.getLatestOpenConsultation();
+          : undefined;
+        if (!consultation) {
+          consultation = this.store.getLatestOpenConsultation();
+        }
         if (!consultation) {
           return { status: 'no_open_consultation' };
         }
@@ -869,9 +872,12 @@ export class OperatorConversationService {
         await this.notice(message.from, UNAVAILABLE);
         return;
       }
-      const consultation = parsed.data.consultationId !== undefined
+      let consultation = parsed.data.consultationId !== undefined
         ? this.store.getLatestOpenConsultation(parsed.data.consultationId)
-        : this.store.getLatestOpenConsultation();
+        : undefined;
+      if (!consultation) {
+        consultation = this.store.getLatestOpenConsultation();
+      }
       if (!consultation) {
         this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
         await this.notice(message.from, 'No hay ninguna consulta abierta de cliente para responder.');
@@ -1393,7 +1399,7 @@ function instructions(tools: AiToolSet): string {
     'Decide tú cuándo responder, preguntar o usar herramientas; puedes consultar varias veces. Herramientas disponibles:',
     capabilities || '(ninguna operación Odoo disponible)',
     'No tienes otras operaciones. Ofrece solo lo que esas herramientas permiten: pausar o reanudar consultas de clientes, consultar el estado de consultas de clientes, proponer borrador de respuesta para consultas abiertas de clientes, buscar productos, proponer crear un nuevo producto o varios en lote (2 a 20 productos), actualizar campos de productos existentes individualmente o en lote (2 a 20 productos) o archivarlos (individual o en lote de 2 a 50 productos). Nunca ofrezcas editar productos o añadir referencias a productos existentes fuera de las herramientas de actualización y archivo, ni cambiar stock o imágenes, ni borrar definitivamente. Nunca prometas pedidos ni compras.',
-    'Cuando el operador dé instrucciones sobre qué responder a un cliente (ej. «dile que...», «respóndele que...», «no puedes decirle que...»), incorpora cualquier dato o precio aplicable del catálogo y llama a draft_customer_reply. La herramienta prepara la vista previa y solicita confirmación («sí» u «ok»). Nunca afirmes que el mensaje ya fue enviado antes de la confirmación del operador.',
+    'Cuando el operador dé instrucciones sobre qué responder a un cliente (ej. «dile que...», «respóndele que...», «no puedes decirle que...»), incorpora cualquier dato o precio aplicable del catálogo y llama a draft_customer_reply sin consultationId (salvo que el operador mencione expresamente un número de consulta). La herramienta toma automáticamente la consulta abierta del cliente, prepara la vista previa y solicita confirmación («sí» u «ok»). Nunca afirmes que el mensaje ya fue enviado antes de la confirmación del operador.',
     'Si el operador pide pausar, detener o silenciar la recepción de mensajes o consultas de clientes, o reanudarlas o reactivarlas en lenguaje natural, invoca la herramienta set_customer_inquiries con enabled=false o enabled=true según corresponda. Responde de forma cercana y concisa en español confirmando el nuevo estado (por ejemplo, «Listo, pausé las consultas de clientes...» o «Listo, reactivé las consultas de clientes...»).',
     'Si el operador pregunta si las consultas están activas o pausadas, usa get_customer_inquiries_status e infórmale de forma concisa.',
     'Si el operador pregunta qué productos hay o pide ver el catálogo general, usa search_products sin query. Menciona el total de productos y lista los devueltos con su precio de venta.',
