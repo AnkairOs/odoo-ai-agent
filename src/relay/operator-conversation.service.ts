@@ -224,11 +224,43 @@ export class OperatorConversationService {
           await this.dispatchCustomerReply(action);
           this.store.setReplied(action.consultationId, action.replyText);
           this.store.finishConversationAction(message.from, message.phoneNumberId, message.id, action.id, 'created');
+          let updated = withHumanAnswer(state.messages, message.text!, action.approvalId);
+          updated.push(approvalResponse(action.approvalId, true));
+          updated.push({
+            role: 'tool',
+            content: [{
+              type: 'tool-result',
+              toolCallId: action.toolCallId,
+              toolName: 'draft_customer_reply',
+              output: { type: 'json', value: { status: 'sent', replyText: action.replyText } },
+            }],
+          });
+          updated.push({
+            role: 'assistant',
+            content: [{ type: 'text', text: '¡Listo! Mensaje enviado al cliente.' }],
+          });
+          this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, updated);
           await this.notice(message.from, '¡Listo! Mensaje enviado al cliente.');
           return;
         }
         if (decision === 'reject') {
           this.store.cancelConversationAction(message.from, message.phoneNumberId, message.id, action.id);
+          let updated = withHumanAnswer(state.messages, message.text!, action.approvalId);
+          updated.push(approvalResponse(action.approvalId, false));
+          updated.push({
+            role: 'tool',
+            content: [{
+              type: 'tool-result',
+              toolCallId: action.toolCallId,
+              toolName: 'draft_customer_reply',
+              output: { type: 'json', value: { status: 'cancelled' } },
+            }],
+          });
+          updated.push({
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Listo, no lo envié.' }],
+          });
+          this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, updated);
           await this.notice(message.from, 'Listo, no lo envié.');
           return;
         }
