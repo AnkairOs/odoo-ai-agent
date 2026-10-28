@@ -40,7 +40,7 @@ function parseReceivedMessage(payload: unknown): InboundMessage | undefined {
     from,
     contactName: asString(conversation.contact_name),
     type: asString(message.type) ?? 'unknown',
-    text: isRecord(message.text) ? asString(message.text.body) : undefined,
+    text: resolveMessageText(message),
     quotedMessageId: isRecord(message.context)
       ? asString(message.context.id)
       : undefined,
@@ -58,6 +58,46 @@ export function isInboundMessage(value: unknown): value is InboundMessage {
     isOptionalString(value.text) &&
     isOptionalString(value.quotedMessageId)
   );
+}
+
+function resolveMessageText(
+  message: Record<string, unknown>,
+): string | undefined {
+  if (isRecord(message.text)) {
+    const textBody = asString(message.text.body);
+    if (textBody) {
+      return textBody;
+    }
+  }
+
+  const kapso = isRecord(message.kapso) ? message.kapso : undefined;
+  if (kapso) {
+    if (isRecord(kapso.transcript)) {
+      const transcriptText = asString(kapso.transcript.text);
+      if (transcriptText) {
+        return `[Audio]: ${transcriptText}`;
+      }
+    }
+    const content = asString(kapso.content);
+    if (content) {
+      const match = content.match(/Transcript:\s*([\s\S]+)$/i);
+      if (match && match[1]?.trim()) {
+        return `[Audio]: ${match[1].trim()}`;
+      }
+    }
+  }
+
+  for (const mediaKey of ['image', 'video', 'document'] as const) {
+    const mediaObj = message[mediaKey];
+    if (isRecord(mediaObj)) {
+      const caption = asString(mediaObj.caption);
+      if (caption) {
+        return caption;
+      }
+    }
+  }
+
+  return undefined;
 }
 
 function isOptionalString(value: unknown): boolean {

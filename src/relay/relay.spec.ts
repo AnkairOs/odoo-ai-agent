@@ -177,6 +177,7 @@ interface InboundOptions {
   name?: string;
   type?: string;
   phoneNumberId?: string;
+  kapso?: Record<string, unknown>;
 }
 
 function inbound(opts: InboundOptions) {
@@ -192,6 +193,7 @@ function inbound(opts: InboundOptions) {
       ...(opts.contextId
         ? { context: { from: '15559999999', id: opts.contextId } }
         : {}),
+      ...(opts.kapso ? { kapso: opts.kapso } : {}),
     },
     conversation: {
       id: `conv_${opts.from}`,
@@ -629,6 +631,30 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       notificationFor('[El cliente envió un mensaje de tipo image sin texto]')
         .body,
     ).toContain('Consulta #1');
+  });
+
+  it('forwards audio customer messages with Kapso transcript in notification', async () => {
+    await deliver(
+      inbound({
+        id: 'wamid.A1',
+        from: CUSTOMER_A,
+        type: 'audio',
+        kapso: {
+          has_media: true,
+          transcript: {
+            text: 'Estimado, quiero una cuenta de TV en vivo',
+          },
+        },
+      }),
+    ).expect(200);
+
+    const notif = notificationFor(
+      '[Audio]: Estimado, quiero una cuenta de TV en vivo',
+    );
+    expect(notif.body).toContain('Consulta #1');
+    expect(notif.body).toContain(
+      '[Audio]: Estimado, quiero una cuenta de TV en vivo',
+    );
   });
 
   it('does not resend a failed notification when the customer message is redelivered', async () => {
