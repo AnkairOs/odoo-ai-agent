@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 export interface OutgoingText {
@@ -24,6 +24,8 @@ const REQUEST_TIMEOUT_MS = 8000;
 
 @Injectable()
 export class KapsoSender implements WhatsAppSender {
+  private readonly logger = new Logger(KapsoSender.name);
+
   constructor(private readonly configService: ConfigService) {}
 
   async sendText(message: OutgoingText): Promise<SendResult> {
@@ -51,9 +53,17 @@ export class KapsoSender implements WhatsAppSender {
     }
 
     if (response.status >= 400 && response.status < 500) {
+      const errorText = await response.text().catch(() => '');
+      this.logger.warn(
+        `Kapso rejected text message HTTP ${response.status} to ${message.to}: ${errorText}`,
+      );
       return { kind: 'rejected', reason: `HTTP ${response.status}` };
     }
     if (!response.ok) {
+      const errorText = await response.text().catch(() => '');
+      this.logger.error(
+        `Kapso server error HTTP ${response.status} to ${message.to}: ${errorText}`,
+      );
       return { kind: 'unknown', reason: `HTTP ${response.status}` };
     }
     const messageId = extractMessageId(

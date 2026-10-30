@@ -458,7 +458,7 @@ describe('open consultation queries and status transitions', () => {
     expect(store.getLatestOpenConsultation()).toBeUndefined();
   });
 
-  it('returns undefined for consultations not awaiting reply', () => {
+  it('returns undefined for consultations not awaiting reply and includes notify_failed', () => {
     const id = store.createConsultation({
       customerWaId: 'cust-1',
       customerMessageId: 'm-1',
@@ -469,8 +469,12 @@ describe('open consultation queries and status transitions', () => {
     expect(store.getStatus(id)).toBe('notifying');
     expect(store.getLatestOpenConsultation()).toBeUndefined();
 
-    // In status 'notify_failed'
+    // In status 'notify_failed': should be available so operator can reply
     store.recordNotificationFailed(id, 'notify_failed', 'err');
+    expect(store.getLatestOpenConsultation()?.id).toBe(id);
+
+    // In status 'replied'
+    store.setReplied(id, 'Sí');
     expect(store.getLatestOpenConsultation()).toBeUndefined();
   });
 

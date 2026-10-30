@@ -657,6 +657,56 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
     );
   });
 
+  it('drains unnotified consultations automatically when operator writes back', async () => {
+    // 1. Customer writes while operator window is closed (HTTP 422)
+    sender.failNext({ kind: 'rejected', reason: 'HTTP 422' });
+    await deliver(
+      inbound({ id: 'wamid.C1', from: CUSTOMER_A, body: 'Buenas tardes demo' }),
+    ).expect(200);
+
+    const store = app.get(RelayStore);
+    const unnotified = store.getUnnotifiedConsultations();
+    expect(unnotified).toHaveLength(1);
+    expect(unnotified[0].status).toBe('notify_failed');
+
+    // 2. Operator sends 'hola' (reopening window)
+    await deliver(
+      inbound({ id: 'wamid.OP1', from: OPERATOR, body: 'hola' }),
+    ).expect(200);
+
+    // 3. Notification for consultation #1 was retried and delivered!
+    const notif = notificationFor('Buenas tardes demo');
+    expect(notif.body).toContain('Consulta #1');
+    expect(store.getUnnotifiedConsultations()).toHaveLength(0);
+    expect(store.getStatus(1)).toBe('awaiting_reply');
+  });
+
+  it('sends 23-hour window warning when checkOperatorWindowExpiring is triggered', async () => {
+    const store = app.get(RelayStore);
+    const relay = app.get(RelayService);
+
+    const baseTime = 1_000_000;
+    store.recordOperatorActivity(baseTime);
+
+    // 23 hours later: checkOperatorWindowExpiring should send the warning
+    const twentyThreeHoursMs = 23 * 60 * 60 * 1000;
+    const sent = await relay.checkOperatorWindowExpiring(
+      baseTime + twentyThreeHoursMs,
+    );
+    expect(sent).toBe(true);
+
+    const warning = sender
+      .to(OPERATOR)
+      .find((m) => m.body.includes('vence en 1 hora'));
+    expect(warning).toBeDefined();
+
+    // Calling again in the same cycle does not duplicate
+    const again = await relay.checkOperatorWindowExpiring(
+      baseTime + twentyThreeHoursMs + 1000,
+    );
+    expect(again).toBe(false);
+  });
+
   it('does not resend a failed notification when the customer message is redelivered', async () => {
     sender.failNext({ kind: 'unknown', reason: 'timeout' });
     const payload = inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'hola' });

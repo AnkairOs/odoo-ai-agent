@@ -10,6 +10,7 @@ import { RelayService } from './relay.service.js';
 import { RelayJob, RelayStore } from './relay.store.js';
 
 const DEFAULT_TENANT_ID = 'default';
+const WINDOW_CHECK_INTERVAL_MS = 15 * 60 * 1000;
 
 @Injectable()
 export class RelayJobProcessor
@@ -19,6 +20,7 @@ export class RelayJobProcessor
   private running = false;
   private stopped = false;
   private drained: Promise<void> = Promise.resolve();
+  private windowCheckTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly configService: ConfigService,
@@ -29,10 +31,15 @@ export class RelayJobProcessor
   onApplicationBootstrap() {
     this.store.resumeInterruptedJobs();
     this.kick();
+    this.startWindowCheck();
   }
 
   async onModuleDestroy() {
     this.stopped = true;
+    if (this.windowCheckTimer) {
+      clearInterval(this.windowCheckTimer);
+      this.windowCheckTimer = undefined;
+    }
     await this.whenIdle();
   }
 
@@ -47,6 +54,15 @@ export class RelayJobProcessor
     while (this.running) {
       await this.drained;
     }
+  }
+
+  private startWindowCheck() {
+    this.windowCheckTimer = setInterval(() => {
+      this.relay.checkOperatorWindowExpiring().catch((err) => {
+        this.logger.warn(`Operator window check error: ${describe(err)}`);
+      });
+    }, WINDOW_CHECK_INTERVAL_MS);
+    this.windowCheckTimer.unref?.();
   }
 
   private kick() {

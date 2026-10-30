@@ -467,6 +467,8 @@ const SCHEMA = `
 const OPEN_STATUSES =
   "('notifying', 'notify_failed', 'notify_unknown', 'awaiting_reply')";
 const UNNOTIFIED_STATUSES = "('notifying', 'notify_failed', 'notify_unknown')";
+const PENDING_REPLY_STATUSES =
+  "('awaiting_reply', 'notify_failed', 'notify_unknown')";
 
 const MAX_JOB_ATTEMPTS = 3;
 const PAST_RESULTS_LIMIT = 5;
@@ -532,6 +534,71 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       )
       .run(String(enabled));
+  }
+
+  recordOperatorActivity(timestampMs = Date.now()): void {
+    this.db
+      .prepare(
+        `INSERT INTO app_settings (key, value)
+         VALUES ('last_operator_inbound_at', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(String(timestampMs));
+    this.db
+      .prepare(
+        "DELETE FROM app_settings WHERE key = 'operator_window_warning_sent_at'",
+      )
+      .run();
+  }
+
+  getLastOperatorInboundAt(): number | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT value FROM app_settings WHERE key = 'last_operator_inbound_at'",
+      )
+      .get() as { value: string } | undefined;
+    if (!row) return undefined;
+    const n = Number(row.value);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  recordOperatorWindowWarningSent(timestampMs = Date.now()): void {
+    this.db
+      .prepare(
+        `INSERT INTO app_settings (key, value)
+         VALUES ('operator_window_warning_sent_at', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(String(timestampMs));
+  }
+
+  getOperatorWindowWarningSentAt(): number | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT value FROM app_settings WHERE key = 'operator_window_warning_sent_at'",
+      )
+      .get() as { value: string } | undefined;
+    if (!row) return undefined;
+    const n = Number(row.value);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
+  isOperatorWindowExpiring(nowMs = Date.now()): boolean {
+    const lastInbound = this.getLastOperatorInboundAt();
+    if (lastInbound === undefined) {
+      return false;
+    }
+    const elapsed = nowMs - lastInbound;
+    const twentyThreeHoursMs = 23 * 60 * 60 * 1000;
+    const twentyFourHoursMs = 24 * 60 * 60 * 1000;
+    if (elapsed < twentyThreeHoursMs || elapsed >= twentyFourHoursMs) {
+      return false;
+    }
+    const warningSentAt = this.getOperatorWindowWarningSentAt();
+    if (warningSentAt !== undefined && warningSentAt >= lastInbound) {
+      return false;
+    }
+    return true;
   }
 
   markProcessed(messageId: string): boolean {
@@ -986,14 +1053,14 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
             .prepare(
               `SELECT id, customer_wa_id, customer_name, last_customer_message_id, question, status
                FROM consultations
-               WHERE id = ? AND status = 'awaiting_reply'`,
+               WHERE id = ? AND status IN ${PENDING_REPLY_STATUSES}`,
             )
             .get(id)
         : this.db
             .prepare(
               `SELECT id, customer_wa_id, customer_name, last_customer_message_id, question, status
                FROM consultations
-               WHERE status = 'awaiting_reply'
+               WHERE status IN ${PENDING_REPLY_STATUSES}
                ORDER BY id DESC LIMIT 1`,
             )
             .get()
@@ -1034,7 +1101,7 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
       .prepare(
         `SELECT id, customer_wa_id, customer_name, last_customer_message_id, question, status
          FROM consultations
-         WHERE status = 'awaiting_reply'
+         WHERE status IN ${PENDING_REPLY_STATUSES}
          ORDER BY id ASC LIMIT ?`,
       )
       .all(clampedLimit) as Array<{
@@ -1052,6 +1119,39 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
       lastCustomerMessageId: row.last_customer_message_id ?? '',
       question: row.question,
       status: row.status,
+    }));
+  }
+
+  getUnnotifiedConsultations(limit = 10): Array<{
+    id: number;
+    customerWaId: string;
+    customerName?: string;
+    question: string;
+    status: ConsultationStatus;
+  }> {
+    const clampedLimit = Number.isFinite(limit)
+      ? Math.min(50, Math.max(1, Math.trunc(limit)))
+      : 10;
+    const rows = this.db
+      .prepare(
+        `SELECT id, customer_wa_id, customer_name, question, status
+         FROM consultations
+         WHERE status IN ('notify_failed', 'notify_unknown')
+         ORDER BY id ASC LIMIT ?`,
+      )
+      .all(clampedLimit) as Array<{
+        id: number;
+        customer_wa_id: string;
+        customer_name: string | null;
+        question: string;
+        status: ConsultationStatus;
+      }>;
+    return rows.map((r) => ({
+      id: r.id,
+      customerWaId: r.customer_wa_id,
+      customerName: r.customer_name ?? undefined,
+      question: r.question,
+      status: r.status,
     }));
   }
 
@@ -1183,7 +1283,7 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
   claimForReply(id: number): boolean {
     const result = this.db
       .prepare(
-        "UPDATE consultations SET status = 'replying', updated_at = ? WHERE id = ? AND status = 'awaiting_reply'",
+        `UPDATE consultations SET status = 'replying', updated_at = ? WHERE id = ? AND status IN ${PENDING_REPLY_STATUSES}`,
       )
       .run(now(), id);
     return result.changes === 1;

@@ -33,4 +33,6 @@ export const RelayMessages = {
     `No se pudo enviar la respuesta a la consulta #${id} (${reason}). Puedes intentarlo de nuevo citando la notificación.`,
   replyUnknown: (id: number, reason: string) =>
     `No sé si la respuesta a la consulta #${id} llegó (${reason}). Verifica en Kapso antes de volver a escribirle; no se reintentará automáticamente.`,
+  operatorWindowExpiring: () =>
+    '⚠️ Recordatorio de WhatsApp: Tu ventana de conversación de 24 horas vence en 1 hora.\n\nEscribe cualquier mensaje por aquí (por ejemplo un «hola») para mantenerla activa y asegurarte de recibir las consultas de los clientes.',
 };

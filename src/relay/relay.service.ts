@@ -52,6 +52,8 @@ export class RelayService {
     );
     for (const unit of groupCustomerBursts(fresh, operatorWaId)) {
       if (unit.kind === 'operator') {
+        this.store.recordOperatorActivity();
+        await this.drainUnnotifiedConsultations(operatorWaId);
         await this.handleOperatorReply(unit.message, operatorWaId);
       } else {
         if (!this.store.isCustomerInquiriesEnabled()) {
@@ -131,6 +133,64 @@ export class RelayService {
       result.kind === 'rejected' ? 'notify_failed' : 'notify_unknown',
       result.reason,
     );
+  }
+
+  async drainUnnotifiedConsultations(operatorWaId: string): Promise<number> {
+    const pending = this.store.getUnnotifiedConsultations(10);
+    if (pending.length === 0) {
+      return 0;
+    }
+    let drainedCount = 0;
+    for (const item of pending) {
+      const suggestion = await this.suggester.suggest(item.id, item.customerWaId);
+      const result = await this.sender.sendText({
+        to: operatorWaId,
+        body: RelayMessages.notification(
+          item.id,
+          item.customerName ?? 'Cliente',
+          item.customerWaId,
+          item.question,
+          false,
+          suggestion,
+        ),
+      });
+      if (result.kind === 'sent') {
+        this.store.recordNotificationSent(item.id, result.messageId, suggestion);
+        drainedCount++;
+      } else {
+        this.logger.error(
+          `Drain notification for consultation #${item.id} ${result.kind}: ${result.reason}`,
+        );
+        this.store.recordNotificationFailed(
+          item.id,
+          result.kind === 'rejected' ? 'notify_failed' : 'notify_unknown',
+          result.reason,
+        );
+      }
+    }
+    return drainedCount;
+  }
+
+  async checkOperatorWindowExpiring(nowMs = Date.now()): Promise<boolean> {
+    if (!this.store.isOperatorWindowExpiring(nowMs)) {
+      return false;
+    }
+    const operatorWaId = await this.resolveOperatorWaId();
+    if (!operatorWaId || operatorWaId === 'operator') {
+      return false;
+    }
+    const result = await this.sender.sendText({
+      to: operatorWaId,
+      body: RelayMessages.operatorWindowExpiring(),
+    });
+    if (result.kind === 'sent') {
+      this.store.recordOperatorWindowWarningSent(nowMs);
+      return true;
+    }
+    this.logger.warn(
+      `Could not send window expiring warning to operator: ${result.reason}`,
+    );
+    return false;
   }
 
   private async answeredByTriage(
