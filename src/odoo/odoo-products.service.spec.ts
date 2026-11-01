@@ -55,7 +55,7 @@ describe('OdooProductsService read-only lookup', () => {
           domain: [['active', '=', true], ['sale_ok', '=', true], '|', ['name', 'ilike', 'Cable'], ['default_code', 'ilike', 'Cable']],
           fields: ['id', 'name', 'default_code', 'list_price', 'taxes_id'],
           offset: 0,
-          limit: 5,
+          limit: 10,
           order: 'name asc',
         }),
       },
@@ -101,7 +101,7 @@ describe('OdooProductsService read-only lookup', () => {
           domain: [['active', '=', true], ['sale_ok', '=', true], '|', ['name', 'ilike', 'Cable'], ['default_code', 'ilike', 'Cable']],
           fields: ['id', 'name', 'default_code', 'list_price', 'taxes_id'],
           offset: 5,
-          limit: 5,
+          limit: 10,
           order: 'name asc',
         }),
       }),
@@ -140,7 +140,7 @@ describe('OdooProductsService read-only lookup', () => {
             domain: [['active', '=', true], ['sale_ok', '=', true]],
             fields: ['id', 'name', 'default_code', 'list_price', 'taxes_id'],
             offset: 0,
-            limit: 5,
+            limit: 10,
             order: 'id desc',
           }),
         }),
@@ -185,7 +185,7 @@ describe('OdooProductsService read-only lookup', () => {
           domain: [['active', '=', true], ['sale_ok', '=', true]],
           fields: ['id', 'name', 'default_code', 'list_price', 'taxes_id'],
           offset: 10,
-          limit: 5,
+          limit: 10,
           order: 'id desc',
         }),
       }),
@@ -271,7 +271,7 @@ describe('OdooProductsService read-only lookup', () => {
     fetchMock.mockImplementation(async (url) => {
       const u = String(url);
       if (u.endsWith('/search_read')) {
-        return new Response(JSON.stringify(Array.from({ length: 8 }, (_, i) => ({
+        return new Response(JSON.stringify(Array.from({ length: 15 }, (_, i) => ({
           id: i + 1,
           name: 'Cable',
           default_code: null,
@@ -279,16 +279,41 @@ describe('OdooProductsService read-only lookup', () => {
           taxes_id: [],
         }))));
       }
-      if (u.endsWith('/search_count')) return new Response('8');
+      if (u.endsWith('/search_count')) return new Response('15');
       return new Response('not found', { status: 404 });
     });
     const result = await products().search('Cable');
     expect(result.status).toBe('ok');
     if (result.status === 'ok') {
-      expect(result.products).toHaveLength(5);
-      expect(result.total).toBe(8);
+      expect(result.products).toHaveLength(10);
+      expect(result.total).toBe(15);
       expect(result.offset).toBe(0);
     }
+  });
+
+  it('supports custom limit in search options', async () => {
+    fetchMock.mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.endsWith('/search_read')) {
+        return new Response(JSON.stringify([{ id: 1, name: 'Cable', default_code: null, list_price: 10, taxes_id: [] }]));
+      }
+      if (u.endsWith('/search_count')) return new Response('1');
+      return new Response('not found', { status: 404 });
+    });
+    const result = await products().search({ query: 'Cable', limit: 3 });
+    expect(result.status).toBe('ok');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://odoo.example.invalid/json/2/product.product/search_read',
+      expect.objectContaining({
+        body: JSON.stringify({
+          domain: [['active', '=', true], ['sale_ok', '=', true], '|', ['name', 'ilike', 'Cable'], ['default_code', 'ilike', 'Cable']],
+          fields: ['id', 'name', 'default_code', 'list_price', 'taxes_id'],
+          offset: 0,
+          limit: 3,
+          order: 'name asc',
+        }),
+      }),
+    );
   });
 });
 

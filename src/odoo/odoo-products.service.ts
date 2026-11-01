@@ -45,7 +45,7 @@ export class OdooProductsService {
       return { status: 'unavailable' };
     }
 
-    const { query, offset } = resolveSearchParams(parsed.data);
+    const { query, offset, limit } = resolveSearchParams(parsed.data);
     const hasSearchTerm = query !== undefined && query.length > 0;
     const domain = hasSearchTerm
       ? [
@@ -70,7 +70,7 @@ export class OdooProductsService {
           domain,
           fields: ['id', 'name', 'default_code', 'list_price', 'taxes_id'],
           offset,
-          limit: 5,
+          limit,
           order,
         },
       );
@@ -92,7 +92,7 @@ export class OdooProductsService {
 
       return {
         status: 'ok',
-        products: records.data.slice(0, 5),
+        products: records.data.slice(0, limit),
         total: total.data,
         offset,
       };
@@ -137,28 +137,32 @@ export class OdooProductsService {
 export const productIdSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 export const productQuerySchema = z.string().trim().min(1).max(120);
 
+export const DEFAULT_PRODUCT_SEARCH_LIMIT = 10;
+
 export const productSearchInputSchema = z.union([
   z.string().trim().max(120),
   z.object({
     query: z.string().trim().max(120).optional(),
     offset: z.number().int().min(0).max(10_000).optional(),
+    limit: z.number().int().min(1).max(50).optional(),
   }).strict(),
 ]).optional();
 
 type ParsedSearchInput = z.infer<typeof productSearchInputSchema>;
 
-function resolveSearchParams(input: ParsedSearchInput): { query: string | undefined; offset: number } {
+function resolveSearchParams(input: ParsedSearchInput): { query: string | undefined; offset: number; limit: number } {
   if (input === undefined) {
-    return { query: undefined, offset: 0 };
+    return { query: undefined, offset: 0, limit: DEFAULT_PRODUCT_SEARCH_LIMIT };
   }
   if (typeof input === 'string') {
     const trimmed = input.trim();
-    return { query: trimmed.length > 0 ? trimmed : undefined, offset: 0 };
+    return { query: trimmed.length > 0 ? trimmed : undefined, offset: 0, limit: DEFAULT_PRODUCT_SEARCH_LIMIT };
   }
   const trimmed = input.query?.trim();
   return {
     query: trimmed && trimmed.length > 0 ? trimmed : undefined,
     offset: input.offset ?? 0,
+    limit: input.limit ?? DEFAULT_PRODUCT_SEARCH_LIMIT,
   };
 }
 

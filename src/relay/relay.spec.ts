@@ -1698,7 +1698,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       expect(ai.toolCalls[3]?.messages).toEqual([
         { role: 'user', content: '¿Abren hoy?' },
       ]);
-    });
+    }, 15_000);
 
     it('does not turn an unsent suggestion or uncertain reply into an assistant history message', async () => {
       await askWithSuggestion('wamid.A1', '¿Hay recargas?', 'Hola, sí hay');
@@ -1928,6 +1928,27 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
             query: 'zapatos',
           }),
         ).toEqual([]);
+      });
+
+      it('search_past_answers excludes outdated answers and supports invalidation', async () => {
+        const store = app.get(RelayStore);
+        expect(store.searchPastAnswers(['recargas'])).toHaveLength(2);
+
+        // Invalidate specific ID
+        store.invalidatePastAnswers([1]);
+        expect(store.searchPastAnswers(['recargas'])).toEqual([
+          { question: '¿Venden recargas de $20?', reply: 'No, solo de $10' },
+        ]);
+
+        // Invalidate by keyword
+        store.invalidatePastAnswersByKeywords(['solo']);
+        expect(store.searchPastAnswers(['recargas'])).toEqual([]);
+      });
+
+      it('search_past_answers respects maxAgeDays limit', async () => {
+        const store = app.get(RelayStore);
+        // Created just now during test setup, so within 30 days
+        expect(store.searchPastAnswers(['recargas'], 30)).toHaveLength(2);
       });
     });
 

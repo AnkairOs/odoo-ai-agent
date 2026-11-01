@@ -39,6 +39,8 @@ describe('ReplySuggester product lookup', () => {
       expect(Object.keys(request.tools).sort()).toEqual(['get_customer_history', 'search_odoo_products', 'search_past_answers']);
       expect(request.system).toContain('Product results are real catalog data');
       expect(request.system).toContain('omit query to see the active catalog');
+      expect(request.system).toContain('Active products in the Odoo catalog (via search_odoo_products) are the sole source of truth for available products and current pricing');
+      expect(request.system).toContain('For streaming, combos, plans, and pricing inquiries, always prioritize current active combos from Odoo over past answers');
       const schema = request.tools.search_odoo_products?.inputSchema;
       if (!(schema instanceof z.ZodType)) throw new Error('Missing product schema');
       for (const input of [
@@ -52,6 +54,7 @@ describe('ReplySuggester product lookup', () => {
       expect(schema.safeParse({}).success).toBe(true);
       expect(schema.safeParse({ offset: 0 }).success).toBe(true);
       expect(schema.safeParse({ query: 'Cable', offset: 5 }).success).toBe(true);
+      expect(schema.safeParse({ query: 'Cable', limit: 10 }).success).toBe(true);
       expect(await lookup(request, { query: 'Cable' })).toEqual({
         status: 'ok',
         products: [{ id: 1, name: 'Cable', default_code: 'CB1', list_price: 25, taxes_id: [1] }],
@@ -93,7 +96,7 @@ describe('ReplySuggester product lookup', () => {
     const suggester = new ReplySuggester({ isEnabled: () => true, generateWithTools } as unknown as AiService, { getQuestion: () => 'Radio', customerHistory: () => [] } as unknown as RelayStore, { search: vi.fn() } as unknown as OdooProductsService);
     await (mode === 'suggest' ? suggester.suggest(1, 'customer') : suggester.revise(1, 'customer', undefined, 'Responde'));
     expect(generateWithTools).toHaveBeenCalledOnce();
-    expect(generateWithTools.mock.calls[0][0].system).toContain('When search_odoo_products returns matching products, name them in the draft (at most five). If the customer asked for prices, you may state the price from list_price. Never invent prices or discounts not returned by Odoo.');
+    expect(generateWithTools.mock.calls[0][0].system).toContain('When search_odoo_products returns matching products, name them in the draft (at most eight). If the customer asked for prices, you may state the price from list_price. Never invent prices or discounts not returned by Odoo.');
   });
 
   it('never invokes AI or lookup with AI disabled', async () => {
@@ -170,7 +173,7 @@ describe('ReplySuggester product lookup', () => {
         'When the customer asks generally what products exist (e.g. "qué productos tiene", "qué vende"), call search_odoo_products without query to see available active products and present them.',
       );
       expect(request.system).toContain(
-        'When search_odoo_products returns matching products, name them in the draft (at most five). If the customer asked for prices, you may state the price from list_price. Never invent prices or discounts not returned by Odoo.',
+        'When search_odoo_products returns matching products, name them in the draft (at most eight). If the customer asked for prices, you may state the price from list_price. Never invent prices or discounts not returned by Odoo.',
       );
 
       const toolResult = await lookup(request, { offset: 0 });

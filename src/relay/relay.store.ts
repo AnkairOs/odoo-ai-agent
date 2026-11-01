@@ -439,6 +439,7 @@ const SCHEMA = `
     notification_message_id TEXT UNIQUE,
     reply_message_id TEXT,
     last_error TEXT,
+    is_outdated INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -490,6 +491,7 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
     this.db.exec(SCHEMA);
     this.addLastCustomerMessageColumn();
     this.addColumnIfMissing('consultations', 'reply_text');
+    this.addColumnIfMissing('consultations', 'is_outdated', 'INTEGER NOT NULL DEFAULT 0');
     this.addColumnIfMissing('consultation_notifications', 'suggestion');
   }
 
@@ -503,9 +505,9 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
     `);
   }
 
-  private addColumnIfMissing(table: string, column: string) {
+  private addColumnIfMissing(table: string, column: string, typeDef = 'TEXT') {
     if (!this.hasColumn(table, column)) {
-      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeDef}`);
     }
   }
 
@@ -1221,7 +1223,7 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
     return this.db.prepare(query).all(...params) as unknown as PastConsultation[];
   }
 
-  searchPastAnswers(keywords: string[]): PastAnswer[] {
+  searchPastAnswers(keywords: string[], maxAgeDays?: number): PastAnswer[] {
     if (keywords.length === 0) {
       return [];
     }
@@ -1231,16 +1233,48 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
           '(instr(lower(question), ?) > 0 OR instr(lower(reply_text), ?) > 0)',
       )
       .join(' OR ');
+    const ageClause =
+      maxAgeDays !== undefined && maxAgeDays > 0
+        ? ` AND datetime(created_at) >= datetime('now', '-' || ? || ' days')`
+        : '';
+    const ageParams =
+      maxAgeDays !== undefined && maxAgeDays > 0 ? [maxAgeDays] : [];
     return this.db
       .prepare(
         `SELECT question, reply_text AS reply FROM consultations
-         WHERE status = 'replied' AND reply_text IS NOT NULL AND (${matches})
+         WHERE status = 'replied' AND reply_text IS NOT NULL AND (is_outdated IS NULL OR is_outdated = 0)${ageClause} AND (${matches})
          ORDER BY id DESC LIMIT ?`,
       )
       .all(
+        ...ageParams,
         ...keywords.flatMap((keyword) => [keyword, keyword]),
         PAST_RESULTS_LIMIT,
       ) as unknown as PastAnswer[];
+  }
+
+  invalidatePastAnswers(ids: number[]) {
+    if (ids.length === 0) return;
+    const placeholders = ids.map(() => '?').join(', ');
+    this.db
+      .prepare(
+        `UPDATE consultations SET is_outdated = 1 WHERE id IN (${placeholders})`,
+      )
+      .run(...ids);
+  }
+
+  invalidatePastAnswersByKeywords(keywords: string[]) {
+    if (keywords.length === 0) return;
+    const matches = keywords
+      .map(
+        () =>
+          '(instr(lower(question), ?) > 0 OR instr(lower(reply_text), ?) > 0)',
+      )
+      .join(' OR ');
+    this.db
+      .prepare(
+        `UPDATE consultations SET is_outdated = 1 WHERE (${matches})`,
+      )
+      .run(...keywords.flatMap((k) => [k, k]));
   }
 
   getStatus(id: number): ConsultationStatus | undefined {
