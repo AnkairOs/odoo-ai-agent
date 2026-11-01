@@ -27,6 +27,8 @@ export const RelayMessages = {
   onlyText: 'Solo puedo reenviar respuestas de texto. No se envió nada.',
   alreadyReplied: (id: number) =>
     `La consulta #${id} ya fue respondida. No se envió nada.`,
+  alreadyDiscarded: (id: number) =>
+    `La consulta #${id} fue descartada sin responder. No se envió nada.`,
   uncertainPending: (id: number) =>
     `La consulta #${id} tiene un envío con resultado incierto. Verifica en Kapso; no se envió nada.`,
   replyRejected: (id: number, reason: string) =>

@@ -98,6 +98,11 @@ const listOpenConsultationsToolSchema = z.object({
   limit: z.number().int().min(1).max(50).optional(),
 }).strict();
 
+const discardConsultationToolSchema = z.object({
+  consultationId: z.number().int().positive().optional(),
+  reason: z.string().trim().min(1).max(255).optional(),
+}).strict();
+
 const decisionSchema = z.object({ decision: z.enum(['approve', 'reject', 'clarify', 'change']) }).strict();
 
 type SafeBatchUpdateResult =
@@ -548,6 +553,26 @@ export class OperatorConversationService {
             customerWaId: consultation.customerWaId,
             question: consultation.question,
           })),
+        };
+      },
+    });
+    tools.discard_consultation = defineAiTool({
+      description:
+        'Descartar o cerrar una consulta abierta de un cliente sin enviarle ningún mensaje por WhatsApp (ej. spam, mensajes accidentales o consultas resueltas por otro canal). Usar cuando el operador pida no responder, descartar, cerrar, ignorar o quitar de pendientes una consulta.',
+      inputSchema: discardConsultationToolSchema,
+      execute: async (input) => {
+        const consultation = input.consultationId !== undefined
+          ? this.store.getLatestOpenConsultation(input.consultationId)
+          : this.store.getLatestOpenConsultation();
+        if (!consultation) {
+          return { status: 'not_found' };
+        }
+        const ok = this.store.discardConsultation(consultation.id, input.reason);
+        return {
+          status: ok ? 'ok' : 'already_closed',
+          consultationId: consultation.id,
+          customerWaId: consultation.customerWaId,
+          customerName: consultation.customerName,
         };
       },
     });
@@ -1437,11 +1462,11 @@ export class OperatorConversationService {
 
 function instructions(tools: AiToolSet): string {
   const odooCapabilities = Object.entries(tools)
-    .filter(([name]) => !['set_customer_inquiries', 'get_customer_inquiries_status', 'draft_customer_reply', 'list_open_consultations'].includes(name))
+    .filter(([name]) => !['set_customer_inquiries', 'get_customer_inquiries_status', 'draft_customer_reply', 'list_open_consultations', 'discard_consultation'].includes(name))
     .map(([name, tool]) => `${name}: ${tool.description}`)
     .join('\n');
   const controlCapabilities = Object.entries(tools)
-    .filter(([name]) => ['set_customer_inquiries', 'get_customer_inquiries_status', 'draft_customer_reply', 'list_open_consultations'].includes(name))
+    .filter(([name]) => ['set_customer_inquiries', 'get_customer_inquiries_status', 'draft_customer_reply', 'list_open_consultations', 'discard_consultation'].includes(name))
     .map(([name, tool]) => `${name}: ${tool.description}`)
     .join('\n');
   const capabilities = [controlCapabilities, odooCapabilities || '(ninguna operación Odoo disponible)']
@@ -1454,9 +1479,10 @@ function instructions(tools: AiToolSet): string {
     'Nunca menciones nombres de herramientas, pasos internos, IDs internos, códigos técnicos de tipo ni configuración.',
     'Decide tú cuándo responder, preguntar o usar herramientas; puedes consultar varias veces. Herramientas disponibles:',
     capabilities || '(ninguna operación Odoo disponible)',
-    'No tienes otras operaciones. Ofrece solo lo que esas herramientas permiten: pausar o reanudar consultas de clientes, consultar el estado de consultas de clientes, listar consultas abiertas de clientes, proponer borrador de respuesta para consultas abiertas de clientes, buscar productos, proponer crear un nuevo producto o varios en lote (2 a 20 productos), actualizar campos de productos existentes individualmente o en lote (2 a 20 productos) o archivarlos (individual o en lote de 2 a 50 productos). Nunca ofrezcas editar productos o añadir referencias a productos existentes fuera de las herramientas de actualización y archivo, ni cambiar stock o imágenes, ni borrar definitivamente. Nunca prometas pedidos ni compras.',
+    'No tienes otras operaciones. Ofrece solo lo que esas herramientas permiten: pausar o reanudar consultas de clientes, consultar el estado de consultas de clientes, listar consultas abiertas de clientes, proponer borrador de respuesta para consultas abiertas de clientes, descartar o cerrar consultas abiertas sin responder, buscar productos, proponer crear un nuevo producto o varios en lote (2 a 20 productos), actualizar campos de productos existentes individualmente o en lote (2 a 20 productos) o archivarlos (individual o en lote de 2 a 50 productos). Nunca ofrezcas editar productos o añadir referencias a productos existentes fuera de las herramientas de actualización y archivo, ni cambiar stock o imágenes, ni borrar definitivamente. Nunca prometas pedidos ni compras.',
     'Cuando el operador dé instrucciones sobre qué responder a un cliente (ej. «dile que...», «respóndele que...», «no puedes decirle que...»), incorpora cualquier dato o precio aplicable del catálogo y llama a draft_customer_reply sin consultationId (salvo que el operador mencione expresamente un número de consulta). La herramienta toma automáticamente la consulta abierta del cliente, prepara la vista previa y solicita confirmación («sí» u «ok»). Nunca afirmes que el mensaje ya fue enviado antes de la confirmación del operador.',
     'Si el operador pregunta qué clientes tiene pendientes, qué consultas están abiertas, quién está esperando o cuántas consultas hay, usa la herramienta list_open_consultations. Si hay consultas abiertas, lístalas de forma limpia (una por línea con su Consulta #N, nombre/teléfono y resumen de la duda) y recuérdale que puede responder a cualquiera diciendo «Para la consulta #N dile que...» o citando el mensaje. Si no hay consultas abiertas, dile amablemente que no hay clientes esperando respuesta en este momento.',
+    'Si el operador pide descartar, cerrar, ignorar o quitar de pendientes una consulta sin responder al cliente (por ejemplo cuando es spam, un mensaje por error, un código de verificación o algo resuelto externamente), invoca la herramienta discard_consultation indicando el consultationId (si lo especificó o hay una sola consulta) y el motivo opcional. Confírmale de forma concisa que la consulta fue descartada y ya no figura como pendiente.',
     'Si el operador pide pausar, detener o silenciar la recepción de mensajes o consultas de clientes, o reanudarlas o reactivarlas en lenguaje natural, invoca la herramienta set_customer_inquiries con enabled=false o enabled=true según corresponda. Responde de forma cercana y concisa en español confirmando el nuevo estado (por ejemplo, «Listo, pausé las consultas de clientes...» o «Listo, reactivé las consultas de clientes...»).',
     'Si el operador pregunta si las consultas están activas o pausadas, usa get_customer_inquiries_status e infórmale de forma concisa.',
     'Si el operador pregunta qué productos hay o pide ver el catálogo general, usa search_products sin query. Menciona el total de productos y lista los devueltos con su precio de venta.',

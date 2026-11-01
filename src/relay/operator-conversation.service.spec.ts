@@ -195,6 +195,7 @@ describe('private operator conversation through the real SDK', () => {
       'get_customer_inquiries_status',
       'draft_customer_reply',
       'list_open_consultations',
+      'discard_consultation',
     ]);
     expect(h.model.doGenerateCalls[0].prompt[0]).toMatchObject({ role: 'system', content: expect.stringContaining('search_products:') });
   });
@@ -207,6 +208,7 @@ describe('private operator conversation through the real SDK', () => {
       'get_customer_inquiries_status',
       'draft_customer_reply',
       'list_open_consultations',
+      'discard_consultation',
     ]);
     expect(h.model.doGenerateCalls[0].prompt[0]).toMatchObject({ content: expect.stringContaining('(ninguna operación Odoo disponible)') });
     expect(h.fetchMock).not.toHaveBeenCalled();
@@ -1801,6 +1803,82 @@ describe('priced product creation in the operator conversation', () => {
       expect(system).toContain('list_open_consultations');
       expect(system).toContain('Si el operador pregunta qué clientes tiene pendientes');
       expect(system).toContain('no hay clientes esperando respuesta en este momento.');
+    });
+  });
+
+  describe('discard consultation tool and instructions', () => {
+    it('discards an open consultation by ID when operator asks to discard or close it', async () => {
+      const h = setup([
+        call('discard_consultation', { consultationId: 1, reason: 'spam' }, 'discard-1'),
+        text('Listo, descarté la consulta #1 sin responderle al cliente. Ya no figura como pendiente.'),
+      ]);
+      const id = h.store.createConsultation({
+        customerWaId: '447710173736',
+        customerName: 'Spam Sender',
+        customerMessageId: 'msg-5',
+        lastCustomerMessageId: 'msg-5',
+        question: 'FB-123456 es tu código de confirmación',
+      });
+      h.store.recordNotificationSent(id, 'notif-5');
+
+      const handled = await h.say('Lo dejemos así pero que ya no me aparezca como pendiente');
+      expect(handled).toBe(true);
+      expect(h.sent).toEqual([
+        {
+          to: 'operator',
+          body: 'Listo, descarté la consulta #1 sin responderle al cliente. Ya no figura como pendiente.',
+        },
+      ]);
+
+      expect(h.store.getStatus(id)).toBe('discarded');
+      expect(h.store.getOpenConsultations()).toEqual([]);
+
+      const history = h.state().messages;
+      const toolMessage = history.find((m) => m.role === 'tool');
+      expect(JSON.stringify(toolMessage)).toContain('"status":"ok"');
+      expect(JSON.stringify(toolMessage)).toContain(`"consultationId":${id}`);
+      expect(JSON.stringify(toolMessage)).toContain('"customerWaId":"447710173736"');
+    });
+
+    it('discards the latest open consultation when consultationId is omitted', async () => {
+      const h = setup([
+        call('discard_consultation', {}, 'discard-latest'),
+        text('Listo, cerré la consulta pendiente sin enviar mensaje.'),
+      ]);
+      const id = h.store.createConsultation({
+        customerWaId: 'cust-99',
+        customerName: 'Otro',
+        customerMessageId: 'msg-99',
+        lastCustomerMessageId: 'msg-99',
+        question: 'Hola?',
+      });
+      h.store.recordNotificationSent(id, 'notif-99');
+
+      const handled = await h.say('Descarta esa consulta');
+      expect(handled).toBe(true);
+      expect(h.store.getStatus(id)).toBe('discarded');
+      expect(h.store.getOpenConsultations()).toEqual([]);
+    });
+
+    it('returns not_found when trying to discard a non-existent or already closed consultation', async () => {
+      const h = setup([
+        call('discard_consultation', { consultationId: 99 }, 'discard-missing'),
+        text('No encontré ninguna consulta abierta con el ID #99.'),
+      ]);
+
+      const handled = await h.say('Descarta la consulta #99');
+      expect(handled).toBe(true);
+      const history = h.state().messages;
+      const toolMessage = history.find((m) => m.role === 'tool');
+      expect(JSON.stringify(toolMessage)).toContain('"status":"not_found"');
+    });
+
+    it('includes discard_consultation in system prompt instructions', async () => {
+      const h = setup([text('Hola')]);
+      await h.say('Hola');
+      const system = String(h.model.doGenerateCalls[0].prompt[0].content);
+      expect(system).toContain('discard_consultation');
+      expect(system).toContain('descartar, cerrar, ignorar o quitar de pendientes');
     });
   });
 });

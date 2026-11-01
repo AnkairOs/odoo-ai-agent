@@ -356,7 +356,8 @@ export type ConsultationStatus =
   | 'awaiting_reply'
   | 'replying'
   | 'replied'
-  | 'reply_unknown';
+  | 'reply_unknown'
+  | 'discarded';
 
 export interface Consultation {
   id: number;
@@ -1316,6 +1317,17 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
         "UPDATE consultations SET status = 'replied', reply_message_id = ?, reply_text = ?, last_error = NULL, updated_at = ? WHERE id = ?",
       )
       .run(replyMessageId ?? null, replyText, now(), id);
+  }
+
+  discardConsultation(id: number, reason?: string): boolean {
+    const errorText = reason ? `discarded: ${reason}` : 'discarded';
+    const result = this.db
+      .prepare(
+        `UPDATE consultations SET status = 'discarded', last_error = ?, updated_at = ?
+         WHERE id = ? AND status IN ${OPEN_STATUSES}`,
+      )
+      .run(errorText, now(), id);
+    return result.changes === 1;
   }
 
   enqueueJob(tenantId: string, messages: InboundMessage[]): number {

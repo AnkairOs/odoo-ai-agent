@@ -319,9 +319,13 @@ export class RelayService {
 
   private unavailableNotice(consultation: Consultation): string {
     const status = this.store.getStatus(consultation.id);
-    return status === 'replied'
-      ? RelayMessages.alreadyReplied(consultation.id)
-      : RelayMessages.uncertainPending(consultation.id);
+    if (status === 'replied') {
+      return RelayMessages.alreadyReplied(consultation.id);
+    }
+    if (status === 'discarded') {
+      return RelayMessages.alreadyDiscarded(consultation.id);
+    }
+    return RelayMessages.uncertainPending(consultation.id);
   }
 
   private async notifyOperator(

@@ -449,6 +449,28 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
     );
   });
 
+  it('refuses a reply to an already discarded consultation', async () => {
+    await deliver(
+      inbound({ id: 'wamid.DISC1', from: CUSTOMER_A, body: 'spam promo' }),
+    ).expect(200);
+    const quoted = notificationId(notificationFor('spam promo'));
+    app.get(RelayStore).discardConsultation(1, 'spam');
+
+    await deliver(
+      inbound({
+        id: 'wamid.OP_DISC',
+        from: OPERATOR,
+        body: '/enviar algo',
+        contextId: quoted,
+      }),
+    ).expect(200);
+
+    expect(sender.to(CUSTOMER_A).map((m) => m.body)).toEqual([]);
+    expect(sender.to(OPERATOR).at(-1)?.body).toBe(
+      'La consulta #1 fue descartada sin responder. No se envió nada.',
+    );
+  });
+
   it.each(['mensaje intruso', '/enviar autorizado', 'ok'])('never authorizes a non-operator quote: %s', async (body) => {
     await deliver(
       inbound({ id: 'wamid.A1', from: CUSTOMER_A, body: 'hola' }),

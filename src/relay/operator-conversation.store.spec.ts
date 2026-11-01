@@ -535,6 +535,51 @@ describe('open consultation queries and status transitions', () => {
     expect(store.getLatestOpenConsultation()).toBeUndefined();
   });
 
+  it('discards an open consultation, removing it from pending and customer lookup', () => {
+    const id = store.createConsultation({
+      customerWaId: 'cust-1',
+      customerMessageId: 'm-1',
+      lastCustomerMessageId: 'm-1',
+      question: 'FB-123456 código de Facebook',
+    });
+    store.recordNotificationSent(id, 'notif-1');
+    expect(store.getLatestOpenConsultation()?.id).toBe(id);
+    expect(store.findOpenForCustomer('cust-1')?.id).toBe(id);
+
+    const discarded = store.discardConsultation(id, 'spam');
+    expect(discarded).toBe(true);
+    expect(store.getStatus(id)).toBe('discarded');
+    expect(store.getLatestOpenConsultation()).toBeUndefined();
+    expect(store.getOpenConsultations()).toEqual([]);
+    expect(store.findOpenForCustomer('cust-1')).toBeUndefined();
+  });
+
+  it('refuses to discard a non-existent or already replied/discarded consultation', () => {
+    expect(store.discardConsultation(999)).toBe(false);
+
+    const id = store.createConsultation({
+      customerWaId: 'cust-1',
+      customerMessageId: 'm-1',
+      lastCustomerMessageId: 'm-1',
+      question: '¿Precio?',
+    });
+    store.recordNotificationSent(id, 'notif-1');
+
+    store.setReplied(id, 'Respuesta');
+    expect(store.discardConsultation(id)).toBe(false);
+
+    const id2 = store.createConsultation({
+      customerWaId: 'cust-2',
+      customerMessageId: 'm-2',
+      lastCustomerMessageId: 'm-2',
+      question: 'Spam',
+    });
+    store.recordNotificationSent(id2, 'notif-2');
+    expect(store.discardConsultation(id2)).toBe(true);
+    // Second discard attempt fails because it is already discarded
+    expect(store.discardConsultation(id2)).toBe(false);
+  });
+
   it('returns empty array when no open consultations exist', () => {
     expect(store.getOpenConsultations()).toEqual([]);
   });
