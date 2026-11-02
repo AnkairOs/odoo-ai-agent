@@ -99,12 +99,24 @@ describe('ReplySuggester product lookup', () => {
     expect(generateWithTools.mock.calls[0][0].system).toContain('When search_odoo_products returns matching products, name them in the draft (at most eight). If the customer asked for prices, you may state the price from list_price. Never invent prices or discounts not returned by Odoo.');
   });
 
-  it.each(['suggest', 'revise'] as const)('passes maxSteps 8 to %s for broad queries', async (mode) => {
+  it.each(['suggest', 'revise'] as const)('passes maxSteps 8 and timeoutMs 30000 to %s for broad queries', async (mode) => {
     const generateWithTools = vi.fn(async (_request: ToolLoopRequest) => draft);
     const suggester = new ReplySuggester({ isEnabled: () => true, generateWithTools } as unknown as AiService, { getQuestion: () => 'Radio', customerHistory: () => [] } as unknown as RelayStore, { search: vi.fn() } as unknown as OdooProductsService);
     await (mode === 'suggest' ? suggester.suggest(1, 'customer') : suggester.revise(1, 'customer', undefined, 'Responde'));
     expect(generateWithTools).toHaveBeenCalledOnce();
     expect(generateWithTools.mock.calls[0][0].maxSteps).toBe(8);
+    expect(generateWithTools.mock.calls[0][0].timeoutMs).toBe(30000);
+  });
+
+  it('accepts suggestion up to 1200 characters and discards longer suggestions with warning', async () => {
+    const generateWithTools = vi.fn(async (_request: ToolLoopRequest) => ({
+      text: 'x'.repeat(1201),
+      toolsExecuted: [],
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    }));
+    const suggester = new ReplySuggester({ isEnabled: () => true, generateWithTools } as unknown as AiService, { getQuestion: () => 'Radio', customerHistory: () => [] } as unknown as RelayStore, { search: vi.fn() } as unknown as OdooProductsService);
+    const result = await suggester.suggest(1, 'customer');
+    expect(result).toBeUndefined();
   });
 
   it('never invokes AI or lookup with AI disabled', async () => {

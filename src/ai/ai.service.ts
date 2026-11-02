@@ -31,7 +31,7 @@ import type {
 
 const DEFAULT_PROVIDER = 'deepseek';
 const DEFAULT_MODEL = 'deepseek-flash';
-const DEFAULT_TIMEOUT_MS = 8000;
+const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_STEPS = 4;
 const MAX_RETRIES = 1;
 

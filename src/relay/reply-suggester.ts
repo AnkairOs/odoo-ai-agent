@@ -9,7 +9,8 @@ import {
 import { OdooProductsService, productQuerySchema } from '../odoo/odoo-products.service.js';
 import { RelayStore } from './relay.store.js';
 
-const MAX_SUGGESTION_LENGTH = 600;
+const MAX_SUGGESTION_LENGTH = 1200;
+const SUGGEST_TIMEOUT_MS = 30000;
 const MIN_KEYWORD_LENGTH = 3;
 const MAX_KEYWORDS = 5;
 
@@ -51,6 +52,7 @@ export class ReplySuggester {
       ],
       tools: this.tools(consultationId, customerWaId),
       maxSteps: 8,
+      timeoutMs: SUGGEST_TIMEOUT_MS,
     });
     if (!result.ok) {
       this.logger.warn(
@@ -59,9 +61,16 @@ export class ReplySuggester {
       return undefined;
     }
     const text = result.text.trim();
-    return text.length > 0 && text.length <= MAX_SUGGESTION_LENGTH
-      ? text
-      : undefined;
+    if (text.length === 0) {
+      return undefined;
+    }
+    if (text.length > MAX_SUGGESTION_LENGTH) {
+      this.logger.warn(
+        `Suggestion exceeded maximum length of ${MAX_SUGGESTION_LENGTH} characters (${text.length})`,
+      );
+      return undefined;
+    }
+    return text;
   }
 
   async revise(
@@ -89,14 +98,22 @@ Use operator-supplied facts (such as a price), but never infer stock, delivery t
         ],
         tools: this.tools(consultationId, customerWaId),
         maxSteps: 8,
+        timeoutMs: SUGGEST_TIMEOUT_MS,
       });
       if (!result.ok) {
         return undefined;
       }
       const text = result.text.trim();
-      return text.length > 0 && text.length <= MAX_SUGGESTION_LENGTH
-        ? text
-        : undefined;
+      if (text.length === 0) {
+        return undefined;
+      }
+      if (text.length > MAX_SUGGESTION_LENGTH) {
+        this.logger.warn(
+          `Revised suggestion exceeded maximum length of ${MAX_SUGGESTION_LENGTH} characters (${text.length})`,
+        );
+        return undefined;
+      }
+      return text;
     } catch {
       this.logger.warn('Operator draft unavailable');
       return undefined;

@@ -1773,7 +1773,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
     it.each([
       ['an AI failure', undefined],
       ['an empty suggestion', '   '],
-      ['a suggestion over 600 characters', 'a'.repeat(601)],
+      ['a suggestion over 1200 characters', 'a'.repeat(1201)],
     ])(
       'keeps the plain notification and refuses approval after %s',
       async (_label, text) => {
@@ -1793,8 +1793,8 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       },
     );
 
-    it('accepts a suggestion of exactly 600 characters', async () => {
-      const longest = 'a'.repeat(600);
+    it('accepts a suggestion of exactly 1200 characters', async () => {
+      const longest = 'a'.repeat(1200);
       await askWithSuggestion('wamid.A1', '¿Hay?', longest);
 
       expect(notificationFor('¿Hay?').body).toContain(
