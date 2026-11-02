@@ -1,4 +1,4 @@
-const ACCEPTANCE_WORDS = new Set(['ok', 'si', 'dale', 'enviar']);
+const ACCEPTANCE_WORDS = new Set(['ok', 'si', 'sii', 'dale', 'enviar']);
 
 export function isAcceptance(text: string): boolean {
   const normalized = text.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');

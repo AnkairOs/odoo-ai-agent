@@ -34,6 +34,13 @@ const call = (name: string, input: unknown, id = 'pm-call-1'): Result => ({
   warnings: [],
 });
 
+const multiCall = (calls: Array<{ name: string; input: unknown; id: string }>): Result => ({
+  content: calls.map((c) => ({ type: 'tool-call', toolName: c.name, input: JSON.stringify(c.input), toolCallId: c.id })),
+  usage,
+  finishReason: { unified: 'tool-calls', raw: 'tool_calls' },
+  warnings: [],
+});
+
 const decision = (value: string) => text(JSON.stringify({ decision: value }));
 
 const ENV = {
@@ -272,5 +279,59 @@ describe('OperatorConversationService - Payment Methods', () => {
 
     expect(h.paymentMethods.archive).toHaveBeenCalledWith(10);
     expect(h.sent.at(-1)?.body).toContain('Listo ✅ Desactivé la cuenta 2200112233 (Banco Pichincha) en Odoo.');
+  });
+
+  it('handles multiple parallel create_payment_method tool calls by proposing the first one and accepting Sii', async () => {
+    const h = setup([
+      multiCall([
+        {
+          name: 'create_payment_method',
+          input: {
+            accNumber: '2208577366',
+            bankName: 'Banco Pichincha',
+            accHolderName: 'Oscar Joel Ramírez Manzano',
+            note: 'Cuenta transaccional',
+          },
+          id: 'call-pichincha',
+        },
+        {
+          name: 'create_payment_method',
+          input: {
+            accNumber: '0123789268',
+            bankName: 'Banco Guayaquil',
+            accHolderName: 'Oscar Joel Ramírez Manzano',
+            note: 'Ahorros',
+          },
+          id: 'call-guayaquil',
+        },
+      ]),
+      decision('approve'),
+      text('Listo ✅ Registré la primera cuenta.'),
+    ]);
+
+    vi.spyOn(h.paymentMethods, 'create').mockResolvedValue({
+      status: 'created',
+      id: 88,
+    });
+
+    await h.say('Sí: Pichincha 2208577366 y Guayaquil 0123789268');
+
+    // Should NOT send BATCH_SUPPORTED product message
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0].body).not.toContain('productos');
+    expect(h.sent[0].body).toContain('Por ahora registro una cuenta a la vez. Voy a registrar primero la siguiente cuenta en Odoo:');
+    expect(h.sent[0].body).toContain('2208577366');
+    expect(h.sent[0].body).toContain('Banco Pichincha');
+
+    // Operator confirms with Sii
+    await h.say('Sii');
+
+    expect(h.paymentMethods.create).toHaveBeenCalledWith({
+      accNumber: '2208577366',
+      bankName: 'Banco Pichincha',
+      accHolderName: 'Oscar Joel Ramírez Manzano',
+      note: 'Cuenta transaccional',
+    });
+    expect(h.sent.at(-1)?.body).toContain('Listo ✅ Registré la cuenta 2208577366 (Banco Pichincha) en Odoo.');
   });
 });

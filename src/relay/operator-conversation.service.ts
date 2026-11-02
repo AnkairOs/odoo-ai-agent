@@ -165,7 +165,7 @@ function toSafeBatchUpdateResult(result: ProductBatchUpdateResult): SafeBatchUpd
 const CLASSIFIER_INSTRUCTIONS = [
   'Clasifica SOLO la respuesta humana nueva ante la propuesta visible (crear, actualizar o archivar productos, cuentas bancarias o métodos de pago, o enviar respuesta a un cliente).',
   'Decide por el sentido, no por palabras exactas. El operador escribe por WhatsApp de forma informal, con faltas de ortografía y sin tildes.',
-  'approve: acepta la acción propuesta (crear, actualizar, archivar productos o cuentas, o enviar respuesta al cliente), sin pedir cambios. Ejemplos: «Sí», «si», «ok», «OK», «Ok», «dale», «hazlo», «envíalo», «Sí, por favor», «si porfavor», «Dale», «Hazlo», «Créalo», «Créalos», «Actualízalo», «Actualízalos», «Archívalo», «Archívalos», «Agrégala», «agrégala», «Desactívala», «desactívala», «si achvar esta bien», «de una».',
+  'approve: acepta la acción propuesta (crear, actualizar, archivar productos o cuentas, o enviar respuesta al cliente), sin pedir cambios. Ejemplos: «Sí», «si», «ok», «OK», «Ok», «dale», «hazlo», «envíalo», «Sí, por favor», «si porfavor», «Dale», «Hazlo», «Créalo», «Créalos», «Actualízalo», «Actualízalos», «Archívalo», «Archívalos», «Agrégala», «agrégala», «Desactívala», «desactívala», «Sii», «sii», «si achvar esta bien», «de una».',
   'reject: no quiere realizar la acción. Ejemplos: «No», «Cancela», «Mejor no», «Ya no», «No los crees», «No lo archives», «No los archives», «no lo envíes», «no le digas».',
   'change: pide modificar nombre, referencia, precio, costo o IVA; nunca aprueba los datos viejos. En respuesta a cliente, pide cambiar el texto o contenido de la respuesta. Ejemplos: «Sí, pero ponle referencia DDJ» → change; «Cámbiale el nombre a Pioneer 3» → change; «Mejor ponle 50» → change; «Sí, pero sin IVA» → change; «Mejor dile que a 3» → change.',
   'clarify: preguntas, dudas, saludos o temas distintos. Ejemplos: «¿Qué precio tendrá?» → clarify; «Hola» → clarify; «déjame pensarlo» → clarify; «¿Qué productos hay?» → clarify.',
@@ -1277,9 +1277,31 @@ export class OperatorConversationService {
   }
 
   private async propose(message: InboundMessage, history: ModelMessage[], approvals: ConversationApproval[]): Promise<void> {
-    const approval = approvals[0];
-    if (approvals.length !== 1 || !(await this.eligible(message))) {
+    if (!(await this.eligible(message))) {
       this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
+      await this.notice(message.from, UNAVAILABLE);
+      return;
+    }
+
+    let activeApprovals = approvals;
+    const isPaymentMethod = approvals.every((a) =>
+      ['create_payment_method', 'update_payment_method', 'archive_payment_method'].includes(a.toolName),
+    );
+
+    if (approvals.length > 1) {
+      if (isPaymentMethod) {
+        history = settleUnshownApprovals(history, approvals.slice(1));
+        activeApprovals = [approvals[0]];
+      } else {
+        this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
+        await this.notice(message.from, BATCH_SUPPORTED);
+        return;
+      }
+    }
+
+    const approval = activeApprovals[0];
+    if (activeApprovals.length !== 1) {
+      this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, activeApprovals));
       await this.notice(message.from, BATCH_SUPPORTED);
       return;
     }
@@ -1515,8 +1537,9 @@ export class OperatorConversationService {
         await this.notice(message.from, BLOCKED);
         return;
       }
+      const hasMore = approvals.length > 1;
       try {
-        const body = renderPaymentMethodCreatePreview({ ...action, status: 'proposed' } as ConversationCreatePaymentMethodAction);
+        const body = renderPaymentMethodCreatePreview({ ...action, status: 'proposed' } as ConversationCreatePaymentMethodAction, hasMore);
         const sent = await this.sender.sendText({ to: message.from, body });
         if (sent.kind === 'sent') {
           this.store.bindConversationPreview(message.from, message.phoneNumberId, message.id, action.id, sent.messageId);
@@ -1561,8 +1584,9 @@ export class OperatorConversationService {
         await this.notice(message.from, BLOCKED);
         return;
       }
+      const hasMore = approvals.length > 1;
       try {
-        const body = renderPaymentMethodUpdatePreview({ ...action, status: 'proposed' } as ConversationUpdatePaymentMethodAction);
+        const body = renderPaymentMethodUpdatePreview({ ...action, status: 'proposed' } as ConversationUpdatePaymentMethodAction, hasMore);
         const sent = await this.sender.sendText({ to: message.from, body });
         if (sent.kind === 'sent') {
           this.store.bindConversationPreview(message.from, message.phoneNumberId, message.id, action.id, sent.messageId);
@@ -1601,8 +1625,9 @@ export class OperatorConversationService {
         await this.notice(message.from, BLOCKED);
         return;
       }
+      const hasMore = approvals.length > 1;
       try {
-        const body = renderPaymentMethodArchivePreview({ ...action, status: 'proposed' } as ConversationArchivePaymentMethodAction);
+        const body = renderPaymentMethodArchivePreview({ ...action, status: 'proposed' } as ConversationArchivePaymentMethodAction, hasMore);
         const sent = await this.sender.sendText({ to: message.from, body });
         if (sent.kind === 'sent') {
           this.store.bindConversationPreview(message.from, message.phoneNumberId, message.id, action.id, sent.messageId);
@@ -1953,9 +1978,9 @@ function instructions(tools: AiToolSet): string {
     'Si el operador pide pausar, detener o silenciar la recepción de mensajes o consultas de clientes, o reanudarlas o reactivarlas en lenguaje natural, invoca la herramienta set_customer_inquiries con enabled=false o enabled=true según corresponda. Responde de forma cercana y concisa en español confirmando el nuevo estado (por ejemplo, «Listo, pausé las consultas de clientes...» o «Listo, reactivé las consultas de clientes...»).',
     'Si el operador pregunta si las consultas están activas o pausadas, usa get_customer_inquiries_status e infórmale de forma concisa.',
     'Si el operador pregunta qué cuentas bancarias o métodos de pago hay registrados o pide ver las cuentas, usa get_payment_methods. Muestra las cuentas devueltas (banco, número, titular, notas).',
-    'Para registrar una nueva cuenta bancaria, usa create_payment_method: pide el número de cuenta y banco si no se dieron. El servidor generará la vista previa y pedirá confirmación.',
-    'Para actualizar una cuenta bancaria existente (cambiar número, banco, titular o nota), usa update_payment_method pasando su ID y los campos a modificar. Si no conoces el ID, usa primero get_payment_methods para encontrarlo.',
-    'Para desactivar o archivar una cuenta bancaria existente, usa archive_payment_method con el ID de la cuenta.',
+    'Para registrar cuentas bancarias, no existen operaciones en lote: debes proponer siempre UNA SOLA cuenta a la vez usando create_payment_method. Si el operador pide registrar varias cuentas o confirma registrarlas («sí», «dale», etc.), propón la primera con create_payment_method y espera a que sea confirmada antes de registrar la siguiente; nunca llames a create_payment_method más de una vez en el mismo turno. Al terminar de registrar una cuenta, si el operador había pedido registrar otra cuenta pendiente, propón registrar la siguiente.',
+    'Para actualizar una cuenta bancaria existente (cambiar número, banco, titular o nota), usa update_payment_method pasando su ID y los campos a modificar. Si no conoces el ID, usa primero get_payment_methods para encontrarlo. Propón una sola cuenta a la vez.',
+    'Para desactivar o archivar una cuenta bancaria existente, usa archive_payment_method con el ID de la cuenta. Propón una sola cuenta a la vez.',
     'Si el operador pregunta qué productos hay o pide ver el catálogo general, usa search_products sin query. Menciona el total de productos y lista los devueltos con su precio de venta.',
     'Si el operador pide ver más o siguientes productos, usa search_products con el offset correspondiente.',
     'Si el operador pregunta precios de los productos encontrados, indícaselos basándote en el list_price de los resultados.',
@@ -2055,9 +2080,11 @@ function cancelledNotice(action?: ConversationAction): string {
   return CANCELLED;
 }
 
-function renderPaymentMethodCreatePreview(action: ConversationCreatePaymentMethodAction): string {
+function renderPaymentMethodCreatePreview(action: ConversationCreatePaymentMethodAction, hasMore = false): string {
   const lines = [
-    'Voy a registrar la siguiente cuenta en Odoo:',
+    hasMore
+      ? 'Por ahora registro una cuenta a la vez. Voy a registrar primero la siguiente cuenta en Odoo:'
+      : 'Voy a registrar la siguiente cuenta en Odoo:',
     `• Banco: ${action.bankName ?? 'sin especificar'}`,
     `• Número: ${action.accNumber}`,
   ];
@@ -2071,10 +2098,12 @@ function renderPaymentMethodCreatePreview(action: ConversationCreatePaymentMetho
   return lines.join('\n');
 }
 
-function renderPaymentMethodUpdatePreview(action: ConversationUpdatePaymentMethodAction): string {
+function renderPaymentMethodUpdatePreview(action: ConversationUpdatePaymentMethodAction, hasMore = false): string {
   const bankStr = action.currentValues.bankName ? ` (${action.currentValues.bankName})` : '';
   const lines = [
-    `Voy a actualizar la cuenta ${action.currentValues.accNumber}${bankStr} en Odoo:`,
+    hasMore
+      ? `Por ahora actualizo una cuenta a la vez. Voy a actualizar la cuenta ${action.currentValues.accNumber}${bankStr} en Odoo:`
+      : `Voy a actualizar la cuenta ${action.currentValues.accNumber}${bankStr} en Odoo:`,
   ];
   if (action.proposedValues.bankName !== undefined) {
     lines.push(`• Banco: ${action.currentValues.bankName ?? 'sin banco'} ➔ ${action.proposedValues.bankName}`);
@@ -2092,10 +2121,12 @@ function renderPaymentMethodUpdatePreview(action: ConversationUpdatePaymentMetho
   return lines.join('\n');
 }
 
-function renderPaymentMethodArchivePreview(action: ConversationArchivePaymentMethodAction): string {
+function renderPaymentMethodArchivePreview(action: ConversationArchivePaymentMethodAction, hasMore = false): string {
   const bankStr = action.bankName ? ` (${action.bankName})` : '';
   return [
-    `Voy a desactivar la cuenta ${action.accNumber}${bankStr} en Odoo. Ya no se usará para cobros.`,
+    hasMore
+      ? `Por ahora desactivo una cuenta a la vez. Voy a desactivar la cuenta ${action.accNumber}${bankStr} en Odoo. Ya no se usará para cobros.`
+      : `Voy a desactivar la cuenta ${action.accNumber}${bankStr} en Odoo. Ya no se usará para cobros.`,
     '¿La desactivo? Responde «sí» para desactivarla o «no» para cancelar. Vence en 15 minutos.',
   ].join('\n');
 }
