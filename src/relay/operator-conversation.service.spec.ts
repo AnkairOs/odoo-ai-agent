@@ -1965,6 +1965,97 @@ describe('priced product creation in the operator conversation', () => {
       expect(system).toContain('descartar, cerrar, ignorar o quitar de pendientes');
     });
   });
+  describe('unquoted approval after completed action (status === created)', () => {
+    it.each(['sí', 'si', 'ok', 'dale', 'enviar'])(
+      'sends the single pending draft to customer when operator says "%s"',
+      async (word) => {
+        const h = setup([call('create_product', { name: 'Pioneer 2', reference: 'DDJ' }), decision('approve'), text('Listo')]);
+        routeOdoo(h);
+        await h.say('Crea Pioneer 2 con referencia DDJ');
+        await h.say('Sí, créalo');
+        expect(h.state().action).toMatchObject({ status: 'created' });
+
+        const cid = h.store.createConsultation({
+          customerWaId: 'customer-123',
+          customerName: 'Juan Pérez',
+          customerMessageId: 'cmsg-1',
+          lastCustomerMessageId: 'cmsg-1',
+          question: '¿Tienen stock?',
+        });
+        h.store.recordNotificationSent(cid, 'notif-1', 'Sí, tenemos 5 unidades disponibles.');
+
+        const initialModelCalls = h.model.doGenerateCalls.length;
+        await h.say(word);
+
+        expect(h.model.doGenerateCalls.length).toBe(initialModelCalls);
+        expect(h.sent).toContainEqual({
+          to: 'customer-123',
+          body: 'Sí, tenemos 5 unidades disponibles.',
+          contextMessageId: 'cmsg-1',
+        });
+        expect(h.sent.at(-1)).toEqual({
+          to: 'operator',
+          body: `¡Listo! Mensaje enviado al cliente para la consulta #${cid} (Juan Pérez).`,
+        });
+        expect(h.store.getStatus(cid)).toBe('replied');
+      },
+    );
+
+    it('asks for clarification when multiple consultations have suggestions', async () => {
+      const h = setup([call('create_product', { name: 'Pioneer 2', reference: 'DDJ' }), decision('approve'), text('Listo')]);
+      routeOdoo(h);
+      await h.say('Crea Pioneer 2 con referencia DDJ');
+      await h.say('Sí, créalo');
+
+      const c1 = h.store.createConsultation({
+        customerWaId: 'c1',
+        customerMessageId: 'm1',
+        lastCustomerMessageId: 'm1',
+        question: 'q1',
+      });
+      h.store.recordNotificationSent(c1, 'n1', 's1');
+
+      const c2 = h.store.createConsultation({
+        customerWaId: 'c2',
+        customerMessageId: 'm2',
+        lastCustomerMessageId: 'm2',
+        question: 'q2',
+      });
+      h.store.recordNotificationSent(c2, 'n2', 's2');
+
+      await h.say('ok');
+      expect(h.sent.at(-1)?.body).toContain('Hay varias consultas abiertas con propuesta de respuesta (#2, #1)');
+    });
+
+    it('informs that no draft exists when open consultations lack suggestions', async () => {
+      const h = setup([call('create_product', { name: 'Pioneer 2', reference: 'DDJ' }), decision('approve'), text('Listo')]);
+      routeOdoo(h);
+      await h.say('Crea Pioneer 2 con referencia DDJ');
+      await h.say('Sí, créalo');
+
+      const c1 = h.store.createConsultation({
+        customerWaId: 'c1',
+        customerMessageId: 'm1',
+        lastCustomerMessageId: 'm1',
+        question: 'q1',
+      });
+      h.store.recordNotificationSent(c1, 'n1');
+
+      await h.say('sí');
+      expect(h.sent.at(-1)?.body).toContain('pero ninguna tiene un borrador propuesto');
+    });
+
+    it('notifies that no consultations are open when none exist', async () => {
+      const h = setup([call('create_product', { name: 'Pioneer 2', reference: 'DDJ' }), decision('approve'), text('Listo')]);
+      routeOdoo(h);
+      await h.say('Crea Pioneer 2 con referencia DDJ');
+      await h.say('Sí, créalo');
+
+      await h.say('sí');
+      expect(h.sent.at(-1)?.body).toBe('La acción anterior ya fue completada y no hay consultas abiertas esperando confirmación.');
+    });
+  });
+
 });
 
 describe('formatModelReply', () => {

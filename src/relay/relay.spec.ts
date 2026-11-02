@@ -1458,7 +1458,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       } else if (mode === 'throws') {
         vi.spyOn(ai, 'generateWithTools').mockRejectedValueOnce(new Error('failure'));
       } else {
-        ai.suggest(suggestion(mode === 'empty' ? '  ' : 'x'.repeat(601)));
+        ai.suggest(suggestion(mode === 'empty' ? '  ' : 'x'.repeat(1201)));
       }
       await say('OP1', 'Dile que está a $6', notificationId(notificationFor('precio')));
       expect(sender.to(CUSTOMER_A)).toEqual([]);
@@ -1735,7 +1735,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       );
     });
 
-    it.each(['ok', 'OK', ' Ok '])(
+    it.each(['ok', 'OK', ' Ok ', 'si', 'Si', 'sí', 'SÍ', 'dale', 'Dale', 'enviar', 'Enviar'])(
       'sends the suggestion verbatim when the operator answers "%s"',
       async (accept) => {
         await askWithSuggestion('wamid.A1', '¿Hay recargas?', SUGGESTED);

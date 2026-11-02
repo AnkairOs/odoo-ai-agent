@@ -4,7 +4,8 @@ import { OperatorConversationService } from './operator-conversation.service.js'
 import { ConfigService } from '@nestjs/config';
 import { CustomerTriage } from './customer-triage.js';
 import { InboundMessage } from './kapso-payload.js';
-import { RelayMessages } from './relay.messages.js';
+import { RelayMessages, isAcceptance } from './relay.messages.js';
+export { isAcceptance };
 import { Consultation, RelayStore } from './relay.store.js';
 import { ReplySuggester } from './reply-suggester.js';
 import { WHATSAPP_SENDER } from './whatsapp-sender.js';
@@ -339,9 +340,7 @@ export class RelayService {
   }
 }
 
-function isAcceptance(text: string): boolean {
-  return text.trim().toLowerCase() === 'ok';
-}
+
 
 type RelayUnit =
   | { kind: 'operator'; message: InboundMessage }

@@ -1,3 +1,10 @@
+const ACCEPTANCE_WORDS = new Set(['ok', 'si', 'dale', 'enviar']);
+
+export function isAcceptance(text: string): boolean {
+  const normalized = text.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  return ACCEPTANCE_WORDS.has(normalized);
+}
+
 const ROUTES = 'Cita este mensaje: "ok" envía este borrador; otra instrucción pide un borrador privado; /enviar <texto> envía texto literal sin IA.';
 
 export const RelayMessages = {

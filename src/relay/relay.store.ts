@@ -1090,6 +1090,46 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
     };
   }
 
+  getPendingConsultationsWithSuggestion(): Array<{
+    id: number;
+    customerWaId: string;
+    customerName?: string;
+    lastCustomerMessageId: string;
+    question: string;
+    suggestion: string;
+    notificationMessageId: string;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT c.id, c.customer_wa_id, c.customer_name, c.last_customer_message_id, c.question, c.status, n.message_id, n.suggestion
+         FROM consultations c
+         JOIN consultation_notifications n ON n.consultation_id = c.id
+         WHERE c.status IN ${PENDING_REPLY_STATUSES}
+           AND n.suggestion IS NOT NULL AND length(trim(n.suggestion)) > 0
+           AND n.rowid = (SELECT max(rowid) FROM consultation_notifications WHERE consultation_id = c.id)
+         ORDER BY c.id DESC`,
+      )
+      .all() as Array<{
+        id: number;
+        customer_wa_id: string;
+        customer_name: string | null;
+        last_customer_message_id: string | null;
+        question: string;
+        status: ConsultationStatus;
+        message_id: string;
+        suggestion: string;
+      }>;
+    return rows.map((row) => ({
+      id: row.id,
+      customerWaId: row.customer_wa_id,
+      customerName: row.customer_name ?? undefined,
+      lastCustomerMessageId: row.last_customer_message_id ?? '',
+      question: row.question,
+      suggestion: row.suggestion,
+      notificationMessageId: row.message_id,
+    }));
+  }
+
   getOpenConsultations(limit = 20): Array<
     Consultation & {
       question: string;

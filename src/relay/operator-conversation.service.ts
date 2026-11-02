@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Inject, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { isAcceptance } from './relay.messages.js';
 import type { ModelMessage } from 'ai';
 import { z } from 'zod';
 import { AiService } from '../ai/ai.service.js';
@@ -206,7 +207,8 @@ export class OperatorConversationService {
     if (isOk) {
       const isQuotedProposal = !!(action?.visibleMessageId && message.quotedMessageId === action.visibleMessageId);
       const isPendingReplyCustomer = action?.kind === 'reply_customer' && ['proposed', 'pending'].includes(action.status);
-      return isQuotedProposal || isPendingReplyCustomer;
+      const isCreatedAction = action?.status === 'created';
+      return isQuotedProposal || isPendingReplyCustomer || isCreatedAction;
     }
     return true;
   }
@@ -220,6 +222,54 @@ export class OperatorConversationService {
       await this.discardExpiredProposal(message, action, state.messages);
       return;
     }
+    const isApprovalWord = isAcceptance(message.text!);
+    if (!message.quotedMessageId && isApprovalWord && action?.status === 'created') {
+      const pendingWithSuggestion = this.store.getPendingConsultationsWithSuggestion();
+      if (pendingWithSuggestion.length === 1) {
+        const target = pendingWithSuggestion[0];
+        if (!this.store.claimForReply(target.id)) {
+          await this.notice(message.from, `La consulta #${target.id} ya fue respondida o está en proceso.`);
+          return;
+        }
+        const sendResult = await this.sender.sendText({
+          to: target.customerWaId,
+          body: target.suggestion,
+          contextMessageId: target.lastCustomerMessageId,
+        });
+        if (sendResult.kind === 'sent') {
+          this.store.recordReplySent(target.id, sendResult.messageId, target.suggestion);
+          const noticeText = `¡Listo! Mensaje enviado al cliente para la consulta #${target.id}${target.customerName ? ` (${target.customerName})` : ''}.`;
+          await this.notice(message.from, noticeText);
+          const updated = [
+            ...state.messages,
+            { role: 'user' as const, content: message.text! },
+            { role: 'assistant' as const, content: [{ type: 'text' as const, text: noticeText }] },
+          ];
+          this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, updated);
+        } else if (sendResult.kind === 'rejected') {
+          this.store.recordReply(target.id, 'awaiting_reply', undefined, sendResult.reason);
+          await this.notice(message.from, `No se pudo enviar la respuesta a la consulta #${target.id} (${sendResult.reason}). Puedes intentarlo de nuevo citando la notificación.`);
+        } else {
+          this.store.recordReply(target.id, 'reply_unknown', undefined, sendResult.reason);
+          await this.notice(message.from, `No sé si la respuesta a la consulta #${target.id} llegó (${sendResult.reason}). Verifica en WhatsApp.`);
+        }
+        return;
+      }
+      if (pendingWithSuggestion.length > 1) {
+        const ids = pendingWithSuggestion.map((c) => `#${c.id}`).join(', ');
+        await this.notice(message.from, `Hay varias consultas abiertas con propuesta de respuesta (${ids}). Por favor cita la propuesta que deseas enviar o dime a cuál consulta te refieres.`);
+        return;
+      }
+      const openConsultations = this.store.getOpenConsultations();
+      if (openConsultations.length > 0) {
+        const ids = openConsultations.map((c) => `#${c.id}`).join(', ');
+        await this.notice(message.from, `Hay consultas abiertas (${ids}) pero ninguna tiene un borrador propuesto. Cita la consulta a la que deseas responder y dime qué responderle.`);
+        return;
+      }
+      await this.notice(message.from, 'La acción anterior ya fue completada y no hay consultas abiertas esperando confirmación.');
+      return;
+    }
+
     let rejected = false;
     if (action && ['proposed', 'pending', 'approved', 'creating', 'unknown'].includes(action.status)) {
       if (!this.isConfirmable(action)) {
