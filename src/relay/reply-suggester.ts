@@ -50,6 +50,7 @@ export class ReplySuggester {
         { role: 'user', content: question },
       ],
       tools: this.tools(consultationId, customerWaId),
+      maxSteps: 8,
     });
     if (!result.ok) {
       this.logger.warn(
@@ -87,6 +88,7 @@ Use operator-supplied facts (such as a price), but never infer stock, delivery t
           },
         ],
         tools: this.tools(consultationId, customerWaId),
+        maxSteps: 8,
       });
       if (!result.ok) {
         return undefined;

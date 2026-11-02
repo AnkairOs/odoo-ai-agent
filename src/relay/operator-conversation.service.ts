@@ -188,14 +188,25 @@ export class OperatorConversationService {
     const operator = (await this.operatorService?.resolveOperatorPhone()) ?? this.config.get<string>('RELAY_OPERATOR_WA_ID');
     const business = this.config.get<string>('KAPSO_PHONE_NUMBER_ID');
     if (!operator || !business || message.from !== operator || message.phoneNumberId !== business ||
-      message.quotedMessageId || typeof message.text !== 'string' || !message.text.trim() ||
+      typeof message.text !== 'string' || !message.text.trim() ||
       message.text.trimStart().startsWith('/')) {
       return false;
     }
+    const state = this.store.getOperatorConversation(operator, business);
+    const action = state.action;
+
+    if (message.quotedMessageId) {
+      const isQuotedProposal = !!(action?.visibleMessageId && message.quotedMessageId === action.visibleMessageId);
+      if (!isQuotedProposal) {
+        return false;
+      }
+    }
+
     const isOk = message.text.trim().toLowerCase() === 'ok';
     if (isOk) {
-      const action = this.store.getOperatorConversation(operator, business).action;
-      return action?.kind === 'reply_customer' && ['proposed', 'pending'].includes(action.status);
+      const isQuotedProposal = !!(action?.visibleMessageId && message.quotedMessageId === action.visibleMessageId);
+      const isPendingReplyCustomer = action?.kind === 'reply_customer' && ['proposed', 'pending'].includes(action.status);
+      return isQuotedProposal || isPendingReplyCustomer;
     }
     return true;
   }

@@ -99,6 +99,14 @@ describe('ReplySuggester product lookup', () => {
     expect(generateWithTools.mock.calls[0][0].system).toContain('When search_odoo_products returns matching products, name them in the draft (at most eight). If the customer asked for prices, you may state the price from list_price. Never invent prices or discounts not returned by Odoo.');
   });
 
+  it.each(['suggest', 'revise'] as const)('passes maxSteps 8 to %s for broad queries', async (mode) => {
+    const generateWithTools = vi.fn(async (_request: ToolLoopRequest) => draft);
+    const suggester = new ReplySuggester({ isEnabled: () => true, generateWithTools } as unknown as AiService, { getQuestion: () => 'Radio', customerHistory: () => [] } as unknown as RelayStore, { search: vi.fn() } as unknown as OdooProductsService);
+    await (mode === 'suggest' ? suggester.suggest(1, 'customer') : suggester.revise(1, 'customer', undefined, 'Responde'));
+    expect(generateWithTools).toHaveBeenCalledOnce();
+    expect(generateWithTools.mock.calls[0][0].maxSteps).toBe(8);
+  });
+
   it('never invokes AI or lookup with AI disabled', async () => {
     const generateWithTools = vi.fn();
     const search = vi.fn();

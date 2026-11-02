@@ -1649,6 +1649,90 @@ describe('priced product creation in the operator conversation', () => {
       expect(h.state().action?.status).toBe('created');
     });
 
+    it('sends customer reply on operator approval quoting proposal preview with "ok"', async () => {
+      const h = setup([
+        call('draft_customer_reply', { replyText: 'Solo por perfil a 2.25' }, 'draft-1'),
+        decision('approve'),
+      ]);
+      const consultationId = h.store.createConsultation({
+        customerWaId: 'customer-wa-4',
+        customerName: 'Santiago',
+        customerMessageId: 'wamid.cust-msg-4',
+        lastCustomerMessageId: 'wamid.cust-last-4',
+        question: '¿Tienen cuentas completas o solo perfiles?',
+      });
+      h.store.recordNotificationSent(consultationId, 'wamid.notif-4');
+
+      await h.say('dile que solo por perfil a 2.25');
+      const action = h.state().action;
+      expect(action?.status).toBe('pending');
+      expect(action?.visibleMessageId).toBeDefined();
+
+      const approved = await h.say('ok', { quotedMessageId: action!.visibleMessageId });
+      expect(approved).toBe(true);
+      expect(h.sent[1]).toEqual({
+        to: 'customer-wa-4',
+        body: 'Solo por perfil a 2.25',
+        contextMessageId: 'wamid.cust-last-4',
+      });
+      expect(h.sent[2]).toEqual({
+        to: 'operator',
+        body: '¡Listo! Mensaje enviado al cliente.',
+      });
+      expect(h.store.getStatus(consultationId)).toBe('replied');
+      expect(h.state().action?.status).toBe('created');
+    });
+
+    it('sends customer reply on operator approval quoting proposal preview with "sí"', async () => {
+      const h = setup([
+        call('draft_customer_reply', { replyText: 'Disponible en 5 dólares' }, 'draft-2'),
+        decision('approve'),
+      ]);
+      const consultationId = h.store.createConsultation({
+        customerWaId: 'customer-wa-5',
+        customerMessageId: 'wamid.cust-msg-5',
+        lastCustomerMessageId: 'wamid.cust-last-5',
+        question: '¿Cuánto cuesta?',
+      });
+      h.store.recordNotificationSent(consultationId, 'wamid.notif-5');
+
+      await h.say('respóndele que disponible en 5 dólares');
+      const action = h.state().action;
+      expect(action?.status).toBe('pending');
+      expect(action?.visibleMessageId).toBeDefined();
+
+      const approved = await h.say('sí', { quotedMessageId: action!.visibleMessageId });
+      expect(approved).toBe(true);
+      expect(h.sent[1]).toEqual({
+        to: 'customer-wa-5',
+        body: 'Disponible en 5 dólares',
+        contextMessageId: 'wamid.cust-last-5',
+      });
+      expect(h.sent[2]).toEqual({
+        to: 'operator',
+        body: '¡Listo! Mensaje enviado al cliente.',
+      });
+      expect(h.store.getStatus(consultationId)).toBe('replied');
+      expect(h.state().action?.status).toBe('created');
+    });
+
+    it('creates product on operator approval quoting proposal preview with "ok"', async () => {
+      const h = setup([
+        call('create_product', { name: 'Pioneer 2', reference: 'DDJ' }),
+        decision('approve'),
+      ]);
+      routeOdoo(h);
+      await h.say('Crea Pioneer 2 con referencia DDJ');
+      const action = h.state().action;
+      expect(action?.status).toBe('pending');
+      expect(action?.visibleMessageId).toBeDefined();
+
+      const approved = await h.say('ok', { quotedMessageId: action!.visibleMessageId });
+      expect(approved).toBe(true);
+      expect(h.fetchMock).toHaveBeenCalledTimes(1);
+      expect(h.state().action?.status).toBe('created');
+    });
+
     it('cancels action when operator rejects with "no"', async () => {
       const h = setup([
         call('draft_customer_reply', { replyText: 'Solo por perfil a 2.25' }, 'draft-1'),
