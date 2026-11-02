@@ -125,6 +125,7 @@ describe('OperatorConversationService - Payment Methods', () => {
     expect(names).toContain('create_payment_method');
     expect(names).toContain('update_payment_method');
     expect(names).toContain('archive_payment_method');
+    expect(names).toContain('create_payment_methods');
   });
 
   it('lists registered payment methods via get_payment_methods', async () => {
@@ -281,7 +282,7 @@ describe('OperatorConversationService - Payment Methods', () => {
     expect(h.sent.at(-1)?.body).toContain('Listo ✅ Desactivé la cuenta 2200112233 (Banco Pichincha) en Odoo.');
   });
 
-  it('handles multiple parallel create_payment_method tool calls by proposing the first one and accepting Sii', async () => {
+  it('handles multiple parallel create_payment_method tool calls by proposing in batch and registering all upon confirmation', async () => {
     const h = setup([
       multiCall([
         {
@@ -306,7 +307,7 @@ describe('OperatorConversationService - Payment Methods', () => {
         },
       ]),
       decision('approve'),
-      text('Listo ✅ Registré la primera cuenta.'),
+      text('Listo ✅ Registré las cuentas.'),
     ]);
 
     vi.spyOn(h.paymentMethods, 'create').mockResolvedValue({
@@ -316,22 +317,70 @@ describe('OperatorConversationService - Payment Methods', () => {
 
     await h.say('Sí: Pichincha 2208577366 y Guayaquil 0123789268');
 
-    // Should NOT send BATCH_SUPPORTED product message
+    // Should propose in batch containing BOTH accounts
     expect(h.sent).toHaveLength(1);
     expect(h.sent[0].body).not.toContain('productos');
-    expect(h.sent[0].body).toContain('Por ahora registro una cuenta a la vez. Voy a registrar primero la siguiente cuenta en Odoo:');
+    expect(h.sent[0].body).toContain('Voy a registrar las siguientes 2 cuentas en Odoo:');
     expect(h.sent[0].body).toContain('2208577366');
     expect(h.sent[0].body).toContain('Banco Pichincha');
+    expect(h.sent[0].body).toContain('0123789268');
+    expect(h.sent[0].body).toContain('Banco Guayaquil');
+    expect(h.sent[0].body).toContain('¿Las agrego? Responde «sí» o «ok» para confirmarlas o «no» para cancelar.');
 
     // Operator confirms with Sii
     await h.say('Sii');
 
+    expect(h.paymentMethods.create).toHaveBeenCalledTimes(2);
     expect(h.paymentMethods.create).toHaveBeenCalledWith({
       accNumber: '2208577366',
       bankName: 'Banco Pichincha',
       accHolderName: 'Oscar Joel Ramírez Manzano',
       note: 'Cuenta transaccional',
     });
-    expect(h.sent.at(-1)?.body).toContain('Listo ✅ Registré la cuenta 2208577366 (Banco Pichincha) en Odoo.');
+    expect(h.paymentMethods.create).toHaveBeenCalledWith({
+      accNumber: '0123789268',
+      bankName: 'Banco Guayaquil',
+      accHolderName: 'Oscar Joel Ramírez Manzano',
+      note: 'Ahorros',
+    });
+    expect(h.sent.at(-1)?.body).toContain('Listo ✅ Registré las 2 cuentas bancarias en Odoo.');
+  });
+
+  it('proposes create_payment_methods batch tool and registers all on confirmation', async () => {
+    const h = setup([
+      call('create_payment_methods', {
+        items: [
+          {
+            accNumber: '111222',
+            bankName: 'Banco Pichincha',
+            accHolderName: 'Juan Perez',
+          },
+          {
+            accNumber: '333444',
+            bankName: 'Banco Bolivariano',
+            accHolderName: 'Juan Perez',
+          },
+        ],
+      }),
+      decision('approve'),
+      text('Listo ✅ Cuentas registradas.'),
+    ]);
+
+    vi.spyOn(h.paymentMethods, 'create').mockResolvedValue({
+      status: 'created',
+      id: 99,
+    });
+
+    await h.say('Registra las cuentas de Pichincha 111222 y Bolivariano 333444 a nombre de Juan Perez');
+
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0].body).toContain('Voy a registrar las siguientes 2 cuentas en Odoo:');
+    expect(h.sent[0].body).toContain('111222');
+    expect(h.sent[0].body).toContain('333444');
+
+    await h.say('sí');
+
+    expect(h.paymentMethods.create).toHaveBeenCalledTimes(2);
+    expect(h.sent.at(-1)?.body).toContain('Listo ✅ Registré las 2 cuentas bancarias en Odoo.');
   });
 });

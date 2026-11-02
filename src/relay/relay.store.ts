@@ -179,6 +179,21 @@ export interface ConversationReplyCustomerAction extends ConversationActionBase 
   lastCustomerMessageId: string;
 }
 
+export interface ConversationPaymentMethodBatchItem {
+  bankName?: string;
+  accNumber: string;
+  accHolderName?: string;
+  note?: string;
+}
+
+export interface ConversationCreatePaymentMethodsBatchAction extends ConversationActionBase {
+  kind: 'create_payment_methods_batch';
+  items: ConversationPaymentMethodBatchItem[];
+  outcome?: {
+    completedIds: number[];
+  };
+}
+
 export interface ConversationCreatePaymentMethodAction extends ConversationActionBase {
   kind: 'create_payment_method';
   bankName?: string;
@@ -220,6 +235,7 @@ export type ConversationAction =
   | ConversationUpdateBatchAction
   | ConversationArchiveBatchAction
   | ConversationReplyCustomerAction
+  | ConversationCreatePaymentMethodsBatchAction
   | ConversationCreatePaymentMethodAction
   | ConversationUpdatePaymentMethodAction
   | ConversationArchivePaymentMethodAction;
@@ -232,6 +248,7 @@ export type ConversationActionProposal =
   | (Omit<ConversationUpdateBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'update_batch' })
   | (Omit<ConversationArchiveBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'archive_batch' })
   | (Omit<ConversationReplyCustomerAction, 'status' | 'visibleMessageId'> & { kind: 'reply_customer' })
+  | (Omit<ConversationCreatePaymentMethodsBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'create_payment_methods_batch' })
   | (Omit<ConversationCreatePaymentMethodAction, 'status' | 'visibleMessageId'> & { kind: 'create_payment_method' })
   | (Omit<ConversationUpdatePaymentMethodAction, 'status' | 'visibleMessageId'> & { kind: 'update_payment_method' })
   | (Omit<ConversationArchivePaymentMethodAction, 'status' | 'visibleMessageId'> & { kind: 'archive_payment_method' });
@@ -253,6 +270,7 @@ const APPROVAL_TOOLS = [
   'update_products',
   'archive_products',
   'draft_customer_reply',
+  'create_payment_methods',
   'create_payment_method',
   'update_payment_method',
   'archive_payment_method',
@@ -820,6 +838,25 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
           JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
     }
 
+    if (action.kind === 'create_payment_methods_batch') {
+      if (!Array.isArray(action.items) || action.items.length < 2 || action.items.length > 20) return false;
+      const parsedItems: ConversationPaymentMethodBatchItem[] = [];
+      for (const item of action.items) {
+        const res = createPaymentMethodInputSchema.safeParse(item);
+        if (!res.success) return false;
+        parsedItems.push(res.data);
+      }
+      if (!hasApprovalChain(bounded, action.approvalId, action.toolCallId, 'create_payment_methods')) return false;
+      const stored: ConversationCreatePaymentMethodsBatchAction = {
+        ...action,
+        kind: 'create_payment_methods_batch',
+        items: parsedItems,
+        status: 'proposed',
+      };
+      return this.db.prepare('UPDATE operator_conversations SET action = ?, messages = ? WHERE operator = ? AND business_phone = ? AND busy = ?').run(
+          JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
+    }
+
     if (action.kind === 'create_payment_method') {
       const parsed = createPaymentMethodInputSchema.safeParse({
         bankName: action.bankName,
@@ -999,6 +1036,38 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
     return this.claimConversationAction(operator, businessPhone, eventId, actionId, timestamp);
   }
 
+  claimConversationPaymentMethodsBatch(
+    operator: string,
+    businessPhone: string,
+    eventId: string,
+    actionId: string,
+    toolCallId: string,
+    target: ProductDestination,
+    timestamp: number = Date.now(),
+  ): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
+      action.kind === 'create_payment_methods_batch' &&
+      action.status === 'approved' &&
+      action.visibleMessageId &&
+      action.expiresAt > timestamp &&
+      action.toolCallId === toolCallId &&
+      sameProductDestination(action, target) ? { ...action, status: 'creating' } : undefined);
+  }
+
+  finishConversationPaymentMethodsBatch(
+    operator: string,
+    businessPhone: string,
+    eventId: string,
+    actionId: string,
+    status: 'created' | 'rejected' | 'unknown',
+    completedIds: number[],
+  ): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) => {
+      if (action.kind !== 'create_payment_methods_batch' || action.status !== 'creating') return undefined;
+      return { ...action, status, outcome: { completedIds } };
+    });
+  }
+
   claimConversationPaymentMethod(
     operator: string,
     businessPhone: string,
@@ -1020,7 +1089,7 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
   finishConversationAction(operator: string, businessPhone: string, eventId: string, actionId: string,
     status: 'created' | 'rejected' | 'unknown', productId?: number): boolean {
     return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) => {
-      if (action.status !== 'creating' || isBatchAction(action)) return undefined;
+      if (action.status !== 'creating' || isBatchAction(action) || action.kind === 'create_payment_methods_batch') return undefined;
       if (status === 'created') {
         if (action.kind === 'update' || action.kind === 'archive' || action.kind === 'reply_customer' ||
             action.kind === 'create_payment_method' || action.kind === 'update_payment_method' || action.kind === 'archive_payment_method') {
