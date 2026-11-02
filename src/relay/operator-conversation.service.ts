@@ -21,6 +21,7 @@ import {
 import { OdooProductsService } from '../odoo/odoo-products.service.js';
 import { OdooTaxesService } from '../odoo/odoo-taxes.service.js';
 import { OdooOperatorService } from '../odoo/odoo-operator.service.js';
+import { OdooPaymentMethodsService } from '../odoo/odoo-payment-methods.service.js';
 import type { InboundMessage } from './kapso-payload.js';
 import {
   conversationArchiveBatchPayloadSchema,
@@ -43,6 +44,9 @@ import {
   type ConversationProductUpdateInput,
   type ConversationProposedValues,
   type ConversationReplyCustomerAction,
+  type ConversationCreatePaymentMethodAction,
+  type ConversationUpdatePaymentMethodAction,
+  type ConversationArchivePaymentMethodAction,
   type ConversationUpdateAction,
   type ConversationUpdateBatchAction,
   type ConversationUpdateBatchItem,
@@ -82,6 +86,32 @@ const updateProductToolSchema = z.object({
 
 const archiveProductToolSchema = z.object({
   productId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+}).strict();
+
+const createPaymentMethodToolSchema = z.object({
+  accNumber: z.string().trim().min(1).max(64),
+  bankName: z.string().trim().min(1).max(128).optional(),
+  accHolderName: z.string().trim().min(1).max(128).optional(),
+  note: z.string().trim().min(1).max(500).optional(),
+}).strict();
+
+const updatePaymentMethodToolSchema = z.object({
+  id: z.number().int().positive(),
+  accNumber: z.string().trim().min(1).max(64).optional(),
+  bankName: z.string().trim().min(1).max(128).optional(),
+  accHolderName: z.string().trim().min(1).max(128).optional(),
+  note: z.string().trim().min(1).max(500).optional(),
+}).strict().refine(
+  (data) =>
+    data.accNumber !== undefined ||
+    data.bankName !== undefined ||
+    data.accHolderName !== undefined ||
+    data.note !== undefined,
+  { message: 'At least one field must be provided' },
+);
+
+const archivePaymentMethodToolSchema = z.object({
+  id: z.number().int().positive(),
 }).strict();
 
 const setCustomerInquiriesToolSchema = z.object({
@@ -133,9 +163,9 @@ function toSafeBatchUpdateResult(result: ProductBatchUpdateResult): SafeBatchUpd
   };
 }
 const CLASSIFIER_INSTRUCTIONS = [
-  'Clasifica SOLO la respuesta humana nueva ante la propuesta visible (crear, actualizar o archivar uno o varios productos en lote, o enviar respuesta a un cliente).',
+  'Clasifica SOLO la respuesta humana nueva ante la propuesta visible (crear, actualizar o archivar productos, cuentas bancarias o métodos de pago, o enviar respuesta a un cliente).',
   'Decide por el sentido, no por palabras exactas. El operador escribe por WhatsApp de forma informal, con faltas de ortografía y sin tildes.',
-  'approve: acepta la acción propuesta (crear, actualizar, archivar o enviar respuesta al cliente), sin pedir cambios. Ejemplos: «Sí», «si», «ok», «OK», «Ok», «dale», «hazlo», «envíalo», «Sí, por favor», «si porfavor», «Dale», «Hazlo», «Créalo», «Créalos», «Actualízalo», «Actualízalos», «Archívalo», «Archívalos», «si achvar esta bien», «de una».',
+  'approve: acepta la acción propuesta (crear, actualizar, archivar productos o cuentas, o enviar respuesta al cliente), sin pedir cambios. Ejemplos: «Sí», «si», «ok», «OK», «Ok», «dale», «hazlo», «envíalo», «Sí, por favor», «si porfavor», «Dale», «Hazlo», «Créalo», «Créalos», «Actualízalo», «Actualízalos», «Archívalo», «Archívalos», «Agrégala», «agrégala», «Desactívala», «desactívala», «si achvar esta bien», «de una».',
   'reject: no quiere realizar la acción. Ejemplos: «No», «Cancela», «Mejor no», «Ya no», «No los crees», «No lo archives», «No los archives», «no lo envíes», «no le digas».',
   'change: pide modificar nombre, referencia, precio, costo o IVA; nunca aprueba los datos viejos. En respuesta a cliente, pide cambiar el texto o contenido de la respuesta. Ejemplos: «Sí, pero ponle referencia DDJ» → change; «Cámbiale el nombre a Pioneer 3» → change; «Mejor ponle 50» → change; «Sí, pero sin IVA» → change; «Mejor dile que a 3» → change.',
   'clarify: preguntas, dudas, saludos o temas distintos. Ejemplos: «¿Qué precio tendrá?» → clarify; «Hola» → clarify; «déjame pensarlo» → clarify; «¿Qué productos hay?» → clarify.',
@@ -166,6 +196,7 @@ export class OperatorConversationService {
     private readonly taxes: OdooTaxesService,
     @Inject(WHATSAPP_SENDER) private readonly sender: WhatsAppSender,
     private readonly operatorService?: OdooOperatorService,
+    private readonly paymentMethods?: OdooPaymentMethodsService,
   ) {}
 
   async handle(message: InboundMessage): Promise<boolean> {
@@ -366,6 +397,12 @@ export class OperatorConversationService {
       ? { approvalId: action.approvalId, toolCallId: action.toolCallId, toolName: 'update_products', input: { items: action.items } }
       : action.kind === 'archive_batch'
       ? { approvalId: action.approvalId, toolCallId: action.toolCallId, toolName: 'archive_products', input: { items: action.items.map((i) => ({ productId: i.productId })) } }
+      : action.kind === 'create_payment_method'
+      ? { approvalId: action.approvalId, toolCallId: action.toolCallId, toolName: 'create_payment_method', input: { accNumber: action.accNumber, bankName: action.bankName, accHolderName: action.accHolderName, note: action.note } }
+      : action.kind === 'update_payment_method'
+      ? { approvalId: action.approvalId, toolCallId: action.toolCallId, toolName: 'update_payment_method', input: { id: action.paymentMethodId, ...action.proposedValues } }
+      : action.kind === 'archive_payment_method'
+      ? { approvalId: action.approvalId, toolCallId: action.toolCallId, toolName: 'archive_payment_method', input: { id: action.paymentMethodId } }
       : { approvalId: action.approvalId, toolCallId: action.toolCallId, toolName: 'create_product', input: { name: action.name, reference: action.reference } };
     const settled = settleUnshownApprovals(history, [approval]);
     const saved = this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id,
@@ -427,6 +464,32 @@ export class OperatorConversationService {
         customerName: action.customerName,
         replyText: action.replyText,
       };
+    } else if (action.kind === 'create_payment_method') {
+      proposalData = {
+        kind: 'create_payment_method',
+        bankName: action.bankName,
+        accNumber: action.accNumber,
+        accHolderName: action.accHolderName,
+        note: action.note,
+        companyId: action.companyId,
+      };
+    } else if (action.kind === 'update_payment_method') {
+      proposalData = {
+        kind: 'update_payment_method',
+        paymentMethodId: action.paymentMethodId,
+        currentValues: action.currentValues,
+        proposedValues: action.proposedValues,
+        companyId: action.companyId,
+      };
+    } else if (action.kind === 'archive_payment_method') {
+      proposalData = {
+        kind: 'archive_payment_method',
+        paymentMethodId: action.paymentMethodId,
+        accNumber: action.accNumber,
+        bankName: action.bankName,
+        accHolderName: action.accHolderName,
+        companyId: action.companyId,
+      };
     } else {
       proposalData = {
         kind: 'create',
@@ -465,8 +528,14 @@ export class OperatorConversationService {
               'create_products',
               'update_products',
               'archive_products',
+              ...(this.paymentMethods ? ['create_payment_method', 'update_payment_method', 'archive_payment_method'] : []),
             ]
-          : ['create_product', 'update_product', 'archive_product']),
+          : [
+              'create_product',
+              'update_product',
+              'archive_product',
+              ...(this.paymentMethods ? ['create_payment_method', 'update_payment_method', 'archive_payment_method'] : []),
+            ]),
       ],
       maxSteps: 4,
     });
@@ -504,6 +573,37 @@ export class OperatorConversationService {
       });
     }
     if (this.creation.destination()) {
+    if (this.creation.destination() && this.paymentMethods) {
+      tools.get_payment_methods = defineAiTool({
+        description: 'Consultar las cuentas bancarias y métodos de pago registrados y activos en Odoo. Devuelve id, número de cuenta, titular, banco y notas.',
+        inputSchema: z.object({}).strict(),
+        execute: async () => (await this.eligible(message)) && this.paymentMethods ? this.paymentMethods.list() : { status: 'unavailable', methods: [] },
+      });
+      tools.create_payment_method = defineAiTool({
+        description: 'Proponer registrar una nueva cuenta bancaria o método de pago en Odoo. Requiere número de cuenta (accNumber); banco (bankName), titular (accHolderName) y notas/instrucciones opcionales. Requiere vista previa y confirmación humana posterior.',
+        inputSchema: createPaymentMethodToolSchema,
+        execute: async (input, options) => {
+          try { return await this.executePaymentMethodCreation(message, input, options.toolCallId); }
+          catch { return { status: 'unknown' }; }
+        },
+      });
+      tools.update_payment_method = defineAiTool({
+        description: 'Proponer actualizar una cuenta bancaria existente en Odoo por ID (id obligatorio; accNumber, bankName, accHolderName o note a cambiar). Requiere vista previa comparativa y confirmación humana posterior.',
+        inputSchema: updatePaymentMethodToolSchema,
+        execute: async (input, options) => {
+          try { return await this.executePaymentMethodUpdate(message, input, options.toolCallId); }
+          catch { return { status: 'unknown' }; }
+        },
+      });
+      tools.archive_payment_method = defineAiTool({
+        description: 'Proponer desactivar / archivar una cuenta bancaria en Odoo por ID. Ya no estará activa para cobros. Requiere vista previa y confirmación humana posterior.',
+        inputSchema: archivePaymentMethodToolSchema,
+        execute: async (input, options) => {
+          try { return await this.executePaymentMethodArchive(message, input, options.toolCallId); }
+          catch { return { status: 'unknown' }; }
+        },
+      });
+    }
       tools.list_sales_taxes = defineAiTool({
         description: 'Listar los impuestos de venta activos por porcentaje de la empresa configurada (id, nombre, porcentaje); solo lectura.',
         inputSchema: z.object({}).strict(),
@@ -683,6 +783,183 @@ export class OperatorConversationService {
     this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, [...state.messages,
       { role: 'tool', content: [{ type: 'tool-result', toolName: 'update_product', toolCallId,
         output: { type: 'json', value: result } }] }]);
+    return result;
+  }
+
+  private async executePaymentMethodCreation(
+    message: InboundMessage,
+    input: z.infer<typeof createPaymentMethodToolSchema>,
+    toolCallId: string,
+  ) {
+    const action = this.store.getOperatorConversation(message.from, message.phoneNumberId).action;
+    const target = this.creation.destination();
+    if (
+      !action ||
+      action.kind !== 'create_payment_method' ||
+      !target ||
+      !(await this.eligible(message)) ||
+      action.authorityFingerprint !== this.authorityFingerprint() ||
+      !this.paymentMethods
+    ) {
+      return { status: 'blocked' };
+    }
+    if (
+      !this.store.claimConversationPaymentMethod(
+        message.from,
+        message.phoneNumberId,
+        message.id,
+        action.id,
+        toolCallId,
+        target,
+        Date.now(),
+      )
+    ) {
+      return { status: 'blocked' };
+    }
+    const result = await this.paymentMethods.create({
+      accNumber: action.accNumber,
+      ...(action.bankName ? { bankName: action.bankName } : {}),
+      ...(action.accHolderName ? { accHolderName: action.accHolderName } : {}),
+      ...(action.note ? { note: action.note } : {}),
+    });
+    this.store.finishConversationAction(
+      message.from,
+      message.phoneNumberId,
+      message.id,
+      action.id,
+      result.status === 'created' ? 'created' : (result.status === 'unknown' ? 'unknown' : 'rejected'),
+      result.status === 'created' ? result.id : undefined,
+    );
+    const state = this.store.getOperatorConversation(message.from, message.phoneNumberId);
+    this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, [
+      ...state.messages,
+      {
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolName: 'create_payment_method',
+            toolCallId,
+            output: { type: 'json', value: result },
+          },
+        ],
+      },
+    ]);
+    return result;
+  }
+
+  private async executePaymentMethodUpdate(
+    message: InboundMessage,
+    input: z.infer<typeof updatePaymentMethodToolSchema>,
+    toolCallId: string,
+  ) {
+    const action = this.store.getOperatorConversation(message.from, message.phoneNumberId).action;
+    const target = this.creation.destination();
+    if (
+      !action ||
+      action.kind !== 'update_payment_method' ||
+      !target ||
+      !(await this.eligible(message)) ||
+      action.authorityFingerprint !== this.authorityFingerprint() ||
+      !this.paymentMethods
+    ) {
+      return { status: 'blocked' };
+    }
+    if (
+      !this.store.claimConversationPaymentMethod(
+        message.from,
+        message.phoneNumberId,
+        message.id,
+        action.id,
+        toolCallId,
+        target,
+        Date.now(),
+      )
+    ) {
+      return { status: 'blocked' };
+    }
+    const result = await this.paymentMethods.update({
+      id: action.paymentMethodId,
+      ...action.proposedValues,
+    });
+    this.store.finishConversationAction(
+      message.from,
+      message.phoneNumberId,
+      message.id,
+      action.id,
+      result.status === 'updated' ? 'created' : (result.status === 'unknown' ? 'unknown' : 'rejected'),
+    );
+    const state = this.store.getOperatorConversation(message.from, message.phoneNumberId);
+    this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, [
+      ...state.messages,
+      {
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolName: 'update_payment_method',
+            toolCallId,
+            output: { type: 'json', value: result },
+          },
+        ],
+      },
+    ]);
+    return result;
+  }
+
+  private async executePaymentMethodArchive(
+    message: InboundMessage,
+    input: z.infer<typeof archivePaymentMethodToolSchema>,
+    toolCallId: string,
+  ) {
+    const action = this.store.getOperatorConversation(message.from, message.phoneNumberId).action;
+    const target = this.creation.destination();
+    if (
+      !action ||
+      action.kind !== 'archive_payment_method' ||
+      !target ||
+      !(await this.eligible(message)) ||
+      action.authorityFingerprint !== this.authorityFingerprint() ||
+      !this.paymentMethods
+    ) {
+      return { status: 'blocked' };
+    }
+    if (
+      !this.store.claimConversationPaymentMethod(
+        message.from,
+        message.phoneNumberId,
+        message.id,
+        action.id,
+        toolCallId,
+        target,
+        Date.now(),
+      )
+    ) {
+      return { status: 'blocked' };
+    }
+    const result = await this.paymentMethods.archive(action.paymentMethodId);
+    this.store.finishConversationAction(
+      message.from,
+      message.phoneNumberId,
+      message.id,
+      action.id,
+      result.status === 'archived' ? 'created' : (result.status === 'unknown' ? 'unknown' : 'rejected'),
+    );
+    const state = this.store.getOperatorConversation(message.from, message.phoneNumberId);
+    this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, [
+      ...state.messages,
+      {
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolName: 'archive_payment_method',
+            toolCallId,
+            output: { type: 'json', value: result },
+          },
+        ],
+      },
+    ]);
     return result;
   }
 
@@ -1214,6 +1491,126 @@ export class OperatorConversationService {
       return;
     }
 
+    if (approval.toolName === 'create_payment_method') {
+      const parsed = createPaymentMethodToolSchema.safeParse(approval.input);
+      if (!parsed.success) {
+        this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
+        await this.notice(message.from, UNAVAILABLE);
+        return;
+      }
+      const action: ConversationActionProposal = {
+        kind: 'create_payment_method',
+        accNumber: parsed.data.accNumber,
+        ...(parsed.data.bankName ? { bankName: parsed.data.bankName } : {}),
+        ...(parsed.data.accHolderName ? { accHolderName: parsed.data.accHolderName } : {}),
+        ...(parsed.data.note ? { note: parsed.data.note } : {}),
+        ...target,
+        authorityFingerprint: this.authorityFingerprint(),
+        id: randomUUID(),
+        approvalId: approval.approvalId,
+        toolCallId: approval.toolCallId,
+        expiresAt: Date.now() + 15 * 60_000,
+      };
+      if (!this.store.reserveConversationAction(message.from, message.phoneNumberId, message.id, action, history)) {
+        await this.notice(message.from, BLOCKED);
+        return;
+      }
+      try {
+        const body = renderPaymentMethodCreatePreview({ ...action, status: 'proposed' } as ConversationCreatePaymentMethodAction);
+        const sent = await this.sender.sendText({ to: message.from, body });
+        if (sent.kind === 'sent') {
+          this.store.bindConversationPreview(message.from, message.phoneNumberId, message.id, action.id, sent.messageId);
+        }
+      } catch { /* An unconfirmed delivery never enables approval. */ }
+      return;
+    }
+
+    if (approval.toolName === 'update_payment_method') {
+      const parsed = updatePaymentMethodToolSchema.safeParse(approval.input);
+      if (!parsed.success || !this.paymentMethods) {
+        this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
+        await this.notice(message.from, UNAVAILABLE);
+        return;
+      }
+      const current = await this.paymentMethods.getById(parsed.data.id);
+      if (!current) {
+        this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
+        await this.notice(message.from, `No encontré la cuenta bancaria con ID ${parsed.data.id} en Odoo.`);
+        return;
+      }
+      const { id, ...proposed } = parsed.data;
+      const currentValues = {
+        accNumber: current.accNumber,
+        ...(current.bankName ? { bankName: current.bankName } : {}),
+        ...(current.accHolderName ? { accHolderName: current.accHolderName } : {}),
+        ...(current.note ? { note: current.note } : {}),
+      };
+      const action: ConversationActionProposal = {
+        kind: 'update_payment_method',
+        paymentMethodId: id,
+        currentValues,
+        proposedValues: proposed,
+        ...target,
+        authorityFingerprint: this.authorityFingerprint(),
+        id: randomUUID(),
+        approvalId: approval.approvalId,
+        toolCallId: approval.toolCallId,
+        expiresAt: Date.now() + 15 * 60_000,
+      };
+      if (!this.store.reserveConversationAction(message.from, message.phoneNumberId, message.id, action, history)) {
+        await this.notice(message.from, BLOCKED);
+        return;
+      }
+      try {
+        const body = renderPaymentMethodUpdatePreview({ ...action, status: 'proposed' } as ConversationUpdatePaymentMethodAction);
+        const sent = await this.sender.sendText({ to: message.from, body });
+        if (sent.kind === 'sent') {
+          this.store.bindConversationPreview(message.from, message.phoneNumberId, message.id, action.id, sent.messageId);
+        }
+      } catch { /* An unconfirmed delivery never enables approval. */ }
+      return;
+    }
+
+    if (approval.toolName === 'archive_payment_method') {
+      const parsed = archivePaymentMethodToolSchema.safeParse(approval.input);
+      if (!parsed.success || !this.paymentMethods) {
+        this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
+        await this.notice(message.from, UNAVAILABLE);
+        return;
+      }
+      const current = await this.paymentMethods.getById(parsed.data.id);
+      if (!current) {
+        this.store.saveConversationMessages(message.from, message.phoneNumberId, message.id, settleUnshownApprovals(history, approvals));
+        await this.notice(message.from, `No encontré la cuenta bancaria con ID ${parsed.data.id} en Odoo.`);
+        return;
+      }
+      const action: ConversationActionProposal = {
+        kind: 'archive_payment_method',
+        paymentMethodId: current.id,
+        accNumber: current.accNumber,
+        ...(current.bankName ? { bankName: current.bankName } : {}),
+        ...(current.accHolderName ? { accHolderName: current.accHolderName } : {}),
+        ...target,
+        authorityFingerprint: this.authorityFingerprint(),
+        id: randomUUID(),
+        approvalId: approval.approvalId,
+        toolCallId: approval.toolCallId,
+        expiresAt: Date.now() + 15 * 60_000,
+      };
+      if (!this.store.reserveConversationAction(message.from, message.phoneNumberId, message.id, action, history)) {
+        await this.notice(message.from, BLOCKED);
+        return;
+      }
+      try {
+        const body = renderPaymentMethodArchivePreview({ ...action, status: 'proposed' } as ConversationArchivePaymentMethodAction);
+        const sent = await this.sender.sendText({ to: message.from, body });
+        if (sent.kind === 'sent') {
+          this.store.bindConversationPreview(message.from, message.phoneNumberId, message.id, action.id, sent.messageId);
+        }
+      } catch { /* An unconfirmed delivery never enables approval. */ }
+      return;
+    }
+
     if (approval.toolName === 'create_products') {
       await this.proposeBatchCreation(message, history, approval, target);
       return;
@@ -1464,6 +1861,15 @@ export class OperatorConversationService {
       if (action.kind === 'archive') {
         return `Listo ✅ Archivé «${action.name}» en Odoo (ID ${action.productId}).`;
       }
+      if (action.kind === 'create_payment_method') {
+        return `Listo ✅ Registré la cuenta ${action.accNumber}${action.bankName ? ` (${action.bankName})` : ''} en Odoo.`;
+      }
+      if (action.kind === 'update_payment_method') {
+        return `Listo ✅ Actualicé la cuenta ${action.currentValues.accNumber} en Odoo.`;
+      }
+      if (action.kind === 'archive_payment_method') {
+        return `Listo ✅ Desactivé la cuenta ${action.accNumber}${action.bankName ? ` (${action.bankName})` : ''} en Odoo.`;
+      }
       if (action.kind === 'create_batch') {
         return `¡Listo! Creé los ${action.items.length} productos en Odoo. ¿Deseas hacer algo más con ellos o buscar en el catálogo?`;
       }
@@ -1546,6 +1952,10 @@ function instructions(tools: AiToolSet): string {
     'Si el operador pide descartar, cerrar, ignorar o quitar de pendientes una consulta sin responder al cliente (por ejemplo cuando es spam, un mensaje por error, un código de verificación o algo resuelto externamente), invoca la herramienta discard_consultation indicando el consultationId (si lo especificó o hay una sola consulta) y el motivo opcional. Confírmale de forma concisa que la consulta fue descartada y ya no figura como pendiente.',
     'Si el operador pide pausar, detener o silenciar la recepción de mensajes o consultas de clientes, o reanudarlas o reactivarlas en lenguaje natural, invoca la herramienta set_customer_inquiries con enabled=false o enabled=true según corresponda. Responde de forma cercana y concisa en español confirmando el nuevo estado (por ejemplo, «Listo, pausé las consultas de clientes...» o «Listo, reactivé las consultas de clientes...»).',
     'Si el operador pregunta si las consultas están activas o pausadas, usa get_customer_inquiries_status e infórmale de forma concisa.',
+    'Si el operador pregunta qué cuentas bancarias o métodos de pago hay registrados o pide ver las cuentas, usa get_payment_methods. Muestra las cuentas devueltas (banco, número, titular, notas).',
+    'Para registrar una nueva cuenta bancaria, usa create_payment_method: pide el número de cuenta y banco si no se dieron. El servidor generará la vista previa y pedirá confirmación.',
+    'Para actualizar una cuenta bancaria existente (cambiar número, banco, titular o nota), usa update_payment_method pasando su ID y los campos a modificar. Si no conoces el ID, usa primero get_payment_methods para encontrarlo.',
+    'Para desactivar o archivar una cuenta bancaria existente, usa archive_payment_method con el ID de la cuenta.',
     'Si el operador pregunta qué productos hay o pide ver el catálogo general, usa search_products sin query. Menciona el total de productos y lista los devueltos con su precio de venta.',
     'Si el operador pide ver más o siguientes productos, usa search_products con el offset correspondiente.',
     'Si el operador pregunta precios de los productos encontrados, indícaselos basándote en el list_price de los resultados.',
@@ -1623,6 +2033,9 @@ function askForAction(action: ConversationAction): string {
   if (action.kind === 'reply_customer') return '¿Envío la respuesta al cliente? Responde «sí» o «ok» para enviarla o «no» para cancelar.';
   if (action.kind === 'update') return '¿Lo actualizo? Responde «sí» para actualizarlo o dime qué cambiar.';
   if (action.kind === 'archive') return '¿Lo archivo? Responde «sí» para archivarlo o «no» para cancelar.';
+  if (action.kind === 'create_payment_method') return '¿Agrego la cuenta bancaria? Responde «sí» o «ok» para confirmarla o «no» para cancelar.';
+  if (action.kind === 'update_payment_method') return '¿Actualizo la cuenta bancaria? Responde «sí» para actualizarla o «no» para cancelar.';
+  if (action.kind === 'archive_payment_method') return '¿Desactivo la cuenta bancaria? Responde «sí» para desactivarla o «no» para cancelar.';
   if (action.kind === 'create_batch') return '¿Los creo? Responde «sí» para crearlos o dime qué cambiar.';
   if (action.kind === 'update_batch') return '¿Los actualizo? Responde «sí» o dime qué cambiar.';
   if (action.kind === 'archive_batch') return '¿Los archivo? Responde «sí» para confirmar o «no» para cancelar.';
@@ -1633,10 +2046,58 @@ function cancelledNotice(action?: ConversationAction): string {
   if (action?.kind === 'reply_customer') return 'Listo, no lo envié.';
   if (action?.kind === 'update') return 'Listo, no lo actualicé.';
   if (action?.kind === 'archive') return 'Listo, no lo archivé.';
+  if (action?.kind === 'create_payment_method') return 'Listo, no registré la cuenta.';
+  if (action?.kind === 'update_payment_method') return 'Listo, no actualicé la cuenta.';
+  if (action?.kind === 'archive_payment_method') return 'Listo, no desactivé la cuenta.';
   if (action?.kind === 'create_batch') return 'Listo, no los creé.';
   if (action?.kind === 'update_batch') return 'Listo, no los actualicé.';
   if (action?.kind === 'archive_batch') return 'Listo, no los archivé.';
   return CANCELLED;
+}
+
+function renderPaymentMethodCreatePreview(action: ConversationCreatePaymentMethodAction): string {
+  const lines = [
+    'Voy a registrar la siguiente cuenta en Odoo:',
+    `• Banco: ${action.bankName ?? 'sin especificar'}`,
+    `• Número: ${action.accNumber}`,
+  ];
+  if (action.accHolderName) {
+    lines.push(`• Titular: ${action.accHolderName}`);
+  }
+  if (action.note) {
+    lines.push(`• Nota: ${action.note}`);
+  }
+  lines.push('¿La agrego? Responde «sí» o «ok» para confirmarla o «no» para cancelar. Vence en 15 minutos.');
+  return lines.join('\n');
+}
+
+function renderPaymentMethodUpdatePreview(action: ConversationUpdatePaymentMethodAction): string {
+  const bankStr = action.currentValues.bankName ? ` (${action.currentValues.bankName})` : '';
+  const lines = [
+    `Voy a actualizar la cuenta ${action.currentValues.accNumber}${bankStr} en Odoo:`,
+  ];
+  if (action.proposedValues.bankName !== undefined) {
+    lines.push(`• Banco: ${action.currentValues.bankName ?? 'sin banco'} ➔ ${action.proposedValues.bankName}`);
+  }
+  if (action.proposedValues.accNumber !== undefined) {
+    lines.push(`• Número: ${action.currentValues.accNumber} ➔ ${action.proposedValues.accNumber}`);
+  }
+  if (action.proposedValues.accHolderName !== undefined) {
+    lines.push(`• Titular: ${action.currentValues.accHolderName ?? 'sin titular'} ➔ ${action.proposedValues.accHolderName}`);
+  }
+  if (action.proposedValues.note !== undefined) {
+    lines.push(`• Nota: ${action.currentValues.note ?? 'sin nota'} ➔ ${action.proposedValues.note}`);
+  }
+  lines.push('¿La actualizo? Responde «sí» para actualizarla o «no» para cancelar. Vence en 15 minutos.');
+  return lines.join('\n');
+}
+
+function renderPaymentMethodArchivePreview(action: ConversationArchivePaymentMethodAction): string {
+  const bankStr = action.bankName ? ` (${action.bankName})` : '';
+  return [
+    `Voy a desactivar la cuenta ${action.accNumber}${bankStr} en Odoo. Ya no se usará para cobros.`,
+    '¿La desactivo? Responde «sí» para desactivarla o «no» para cancelar. Vence en 15 minutos.',
+  ].join('\n');
 }
 
 function renderCustomerReplyPreview(action: {

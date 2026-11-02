@@ -14,6 +14,7 @@ import {
   type ConversationProduct, type NewProduct, type ProductDestination,
 } from '../odoo/odoo-product-creation.service.js';
 import { saleTaxSchema } from '../odoo/odoo-taxes.service.js';
+import { createPaymentMethodInputSchema } from '../odoo/odoo-payment-methods.service.js';
 import type { ModelMessage } from 'ai';
 
 const conversationPriceSchema = z.object({
@@ -178,6 +179,39 @@ export interface ConversationReplyCustomerAction extends ConversationActionBase 
   lastCustomerMessageId: string;
 }
 
+export interface ConversationCreatePaymentMethodAction extends ConversationActionBase {
+  kind: 'create_payment_method';
+  bankName?: string;
+  accNumber: string;
+  accHolderName?: string;
+  note?: string;
+}
+
+export interface ConversationUpdatePaymentMethodAction extends ConversationActionBase {
+  kind: 'update_payment_method';
+  paymentMethodId: number;
+  currentValues: {
+    accNumber: string;
+    accHolderName?: string;
+    bankName?: string;
+    note?: string;
+  };
+  proposedValues: {
+    accNumber?: string;
+    accHolderName?: string;
+    bankName?: string;
+    note?: string;
+  };
+}
+
+export interface ConversationArchivePaymentMethodAction extends ConversationActionBase {
+  kind: 'archive_payment_method';
+  paymentMethodId: number;
+  accNumber: string;
+  bankName?: string;
+  accHolderName?: string;
+}
+
 export type ConversationAction =
   | ConversationCreateAction
   | ConversationUpdateAction
@@ -185,7 +219,10 @@ export type ConversationAction =
   | ConversationCreateBatchAction
   | ConversationUpdateBatchAction
   | ConversationArchiveBatchAction
-  | ConversationReplyCustomerAction;
+  | ConversationReplyCustomerAction
+  | ConversationCreatePaymentMethodAction
+  | ConversationUpdatePaymentMethodAction
+  | ConversationArchivePaymentMethodAction;
 
 export type ConversationActionProposal =
   | (Omit<ConversationCreateAction, 'status' | 'visibleMessageId' | 'productId'> & { kind?: 'create'; productId?: number })
@@ -194,7 +231,10 @@ export type ConversationActionProposal =
   | (Omit<ConversationCreateBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'create_batch' })
   | (Omit<ConversationUpdateBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'update_batch' })
   | (Omit<ConversationArchiveBatchAction, 'status' | 'visibleMessageId' | 'outcome'> & { kind: 'archive_batch' })
-  | (Omit<ConversationReplyCustomerAction, 'status' | 'visibleMessageId'> & { kind: 'reply_customer' });
+  | (Omit<ConversationReplyCustomerAction, 'status' | 'visibleMessageId'> & { kind: 'reply_customer' })
+  | (Omit<ConversationCreatePaymentMethodAction, 'status' | 'visibleMessageId'> & { kind: 'create_payment_method' })
+  | (Omit<ConversationUpdatePaymentMethodAction, 'status' | 'visibleMessageId'> & { kind: 'update_payment_method' })
+  | (Omit<ConversationArchivePaymentMethodAction, 'status' | 'visibleMessageId'> & { kind: 'archive_payment_method' });
 
 export interface OperatorConversation {
   messages: ModelMessage[];
@@ -213,6 +253,9 @@ const APPROVAL_TOOLS = [
   'update_products',
   'archive_products',
   'draft_customer_reply',
+  'create_payment_method',
+  'update_payment_method',
+  'archive_payment_method',
 ] as const;
 
 function isBatchAction(action: ConversationAction): action is
@@ -777,6 +820,59 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
           JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
     }
 
+    if (action.kind === 'create_payment_method') {
+      const parsed = createPaymentMethodInputSchema.safeParse({
+        bankName: action.bankName,
+        accNumber: action.accNumber,
+        accHolderName: action.accHolderName,
+        note: action.note,
+      });
+      if (!parsed.success || !hasApprovalChain(bounded, action.approvalId, action.toolCallId, 'create_payment_method')) return false;
+      const stored: ConversationCreatePaymentMethodAction = {
+        ...action,
+        kind: 'create_payment_method',
+        accNumber: parsed.data.accNumber,
+        ...(parsed.data.bankName ? { bankName: parsed.data.bankName } : {}),
+        ...(parsed.data.accHolderName ? { accHolderName: parsed.data.accHolderName } : {}),
+        ...(parsed.data.note ? { note: parsed.data.note } : {}),
+        status: 'proposed',
+      };
+      return this.db.prepare('UPDATE operator_conversations SET action = ?, messages = ? WHERE operator = ? AND business_phone = ? AND busy = ?').run(
+          JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
+    }
+
+    if (action.kind === 'update_payment_method') {
+      const idParsed = z.number().int().positive().safeParse(action.paymentMethodId);
+      if (!idParsed.success || !hasApprovalChain(bounded, action.approvalId, action.toolCallId, 'update_payment_method')) return false;
+      const stored: ConversationUpdatePaymentMethodAction = {
+        ...action,
+        kind: 'update_payment_method',
+        paymentMethodId: idParsed.data,
+        currentValues: action.currentValues,
+        proposedValues: action.proposedValues,
+        status: 'proposed',
+      };
+      return this.db.prepare('UPDATE operator_conversations SET action = ?, messages = ? WHERE operator = ? AND business_phone = ? AND busy = ?').run(
+          JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
+    }
+
+    if (action.kind === 'archive_payment_method') {
+      const idParsed = z.number().int().positive().safeParse(action.paymentMethodId);
+      const accParsed = z.string().min(1).safeParse(action.accNumber);
+      if (!idParsed.success || !accParsed.success || !hasApprovalChain(bounded, action.approvalId, action.toolCallId, 'archive_payment_method')) return false;
+      const stored: ConversationArchivePaymentMethodAction = {
+        ...action,
+        kind: 'archive_payment_method',
+        paymentMethodId: idParsed.data,
+        accNumber: accParsed.data,
+        ...(action.bankName ? { bankName: action.bankName } : {}),
+        ...(action.accHolderName ? { accHolderName: action.accHolderName } : {}),
+        status: 'proposed',
+      };
+      return this.db.prepare('UPDATE operator_conversations SET action = ?, messages = ? WHERE operator = ? AND business_phone = ? AND busy = ?').run(
+          JSON.stringify(stored), JSON.stringify(bounded), operator, businessPhone, eventId).changes === 1;
+    }
+
     if (action.kind === 'reply_customer') {
       const consultationIdParsed = z.number().int().positive().safeParse(action.consultationId);
       const customerWaIdParsed = z.string().trim().min(1).safeParse(action.customerWaId);
@@ -903,12 +999,31 @@ export class RelayStore implements OnModuleInit, OnApplicationShutdown {
     return this.claimConversationAction(operator, businessPhone, eventId, actionId, timestamp);
   }
 
+  claimConversationPaymentMethod(
+    operator: string,
+    businessPhone: string,
+    eventId: string,
+    actionId: string,
+    toolCallId: string,
+    target: ProductDestination,
+    timestamp: number = Date.now(),
+  ): boolean {
+    return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) =>
+      !!action.kind && ['create_payment_method', 'update_payment_method', 'archive_payment_method'].includes(action.kind) &&
+      action.status === 'approved' &&
+      action.visibleMessageId &&
+      action.expiresAt > timestamp &&
+      action.toolCallId === toolCallId &&
+      sameProductDestination(action, target) ? { ...action, status: 'creating' } : undefined);
+  }
+
   finishConversationAction(operator: string, businessPhone: string, eventId: string, actionId: string,
     status: 'created' | 'rejected' | 'unknown', productId?: number): boolean {
     return this.updateConversationAction(operator, businessPhone, eventId, actionId, (action) => {
       if (action.status !== 'creating' || isBatchAction(action)) return undefined;
       if (status === 'created') {
-        if (action.kind === 'update' || action.kind === 'archive' || action.kind === 'reply_customer') {
+        if (action.kind === 'update' || action.kind === 'archive' || action.kind === 'reply_customer' ||
+            action.kind === 'create_payment_method' || action.kind === 'update_payment_method' || action.kind === 'archive_payment_method') {
           return { ...action, status };
         }
         if (!Number.isSafeInteger(productId) || productId! <= 0) return undefined;

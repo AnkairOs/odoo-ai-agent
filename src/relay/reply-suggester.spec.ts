@@ -286,4 +286,63 @@ describe('ReplySuggester product lookup', () => {
     expect(productsService.search).toHaveBeenNthCalledWith(1, { query: 'streaming' });
     expect(productsService.search).toHaveBeenNthCalledWith(2, { offset: 0 });
   });
+
+  it('offers get_payment_methods and suggests bank details when customer asks how to pay', async () => {
+    const paymentMethodsService = {
+      list: vi.fn(async () => ({
+        status: 'ok' as const,
+        methods: [
+          {
+            id: 1,
+            accNumber: '2200112233',
+            accHolderName: 'Tech Store S.A.',
+            bankName: 'Banco Pichincha',
+            note: 'Cuenta de ahorros',
+            active: true,
+          },
+        ],
+      })),
+    };
+
+    const generateWithTools = vi.fn(async (request: ToolLoopRequest): Promise<AiGenerationResult> => {
+      expect(Object.keys(request.tools).sort()).toContain('get_payment_methods');
+      const pmTool = (request.tools as Record<string, { execute: () => Promise<unknown> }>).get_payment_methods;
+      const res = await pmTool.execute();
+      expect(res).toEqual({
+        status: 'ok',
+        methods: [
+          {
+            id: 1,
+            accNumber: '2200112233',
+            accHolderName: 'Tech Store S.A.',
+            bankName: 'Banco Pichincha',
+            note: 'Cuenta de ahorros',
+            active: true,
+          },
+        ],
+      });
+      return {
+        ok: true,
+        text: 'Puedes transferir a Banco Pichincha, cuenta de ahorros 2200112233 a nombre de Tech Store S.A.',
+        toolsExecuted: ['get_payment_methods'],
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      };
+    });
+
+    const store = {
+      getQuestion: vi.fn(() => '¿A qué cuenta puedo pagar?'),
+      customerHistory: vi.fn(() => []),
+    };
+
+    const suggester = new ReplySuggester(
+      { isEnabled: () => true, generateWithTools } as unknown as AiService,
+      store as unknown as RelayStore,
+      {} as unknown as OdooProductsService,
+      paymentMethodsService as unknown as OdooPaymentMethodsService,
+    );
+
+    const reply = await suggester.suggest(44, 'wa-customer-200');
+    expect(reply).toBe('Puedes transferir a Banco Pichincha, cuenta de ahorros 2200112233 a nombre de Tech Store S.A.');
+    expect(paymentMethodsService.list).toHaveBeenCalled();
+  });
 });

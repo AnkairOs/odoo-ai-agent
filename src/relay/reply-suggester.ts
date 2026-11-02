@@ -7,6 +7,7 @@ import {
   type AiToolSet,
 } from '../ai/ai.types.js';
 import { OdooProductsService, productQuerySchema } from '../odoo/odoo-products.service.js';
+import { OdooPaymentMethodsService } from '../odoo/odoo-payment-methods.service.js';
 import { RelayStore } from './relay.store.js';
 
 const MAX_SUGGESTION_LENGTH = 1200;
@@ -23,6 +24,7 @@ Use search_odoo_products to look up product names or references in the configure
 When the customer asks generally what products exist (e.g. "qué productos tiene", "qué vende"), call search_odoo_products without query to see available active products and present them.
 When the customer asks about a category or service (e.g. "streaming", "cuentas", "perfiles", "películas", "series"), search for the terms. If a specific search yields 0 matches, call search_odoo_products without query to inspect the active catalog products and identify matching offerings (e.g. Disney+, Crunchyroll). For streaming, combos, plans, and pricing inquiries, always prioritize current active combos from Odoo over past answers.
 When search_odoo_products returns matching products, name them in the draft (at most eight). If the customer asked for prices, you may state the price from list_price. Never invent prices or discounts not returned by Odoo.
+Active payment methods and bank accounts in Odoo (via get_payment_methods) are the sole source of truth for payment instructions and bank details. When the customer asks how to pay, asks for bank accounts, transfer info, or payment methods, call get_payment_methods to retrieve the real account details (bank, account number, holder, note) and share them accurately. Never invent bank accounts or payment details.
 Never invent prices, stock, dates or promises that the past answers do not support; when you lack that information, draft a short reply that asks for what is missing or says you will confirm.
 Answer only with the message text to send, in the customer's language, short and friendly.`;
 
@@ -34,6 +36,7 @@ export class ReplySuggester {
     private readonly ai: AiService,
     private readonly store: RelayStore,
     private readonly products: OdooProductsService,
+    private readonly paymentMethods?: OdooPaymentMethodsService,
   ) {}
 
   async suggest(
@@ -136,7 +139,8 @@ Use operator-supplied facts (such as a price), but never infer stock, delivery t
   }
 
   private tools(consultationId: number, customerWaId: string): AiToolSet {
-    return {
+    const tools: AiToolSet = {
+
       search_odoo_products: defineAiTool({
         description:
           'Search active products in the fixed business catalog. If query is omitted or empty, lists recent active catalog products ordered by novelty. When provided, filters by product name or reference. Returns products (id, name, default_code, list_price, taxes_id) and total matching products.',
@@ -173,6 +177,15 @@ Use operator-supplied facts (such as a price), but never infer stock, delivery t
           this.store.searchPastAnswers(keywords(query), maxAgeDays ?? 30),
       }),
     };
+    if (this.paymentMethods) {
+      tools.get_payment_methods = defineAiTool({
+        description:
+          'List active bank accounts and payment methods configured for this business in Odoo. Use this when the customer asks how to pay, asks for bank account details, transfer numbers, or payment methods.',
+        inputSchema: z.object({}).strict(),
+        execute: () => this.paymentMethods!.list(),
+      });
+    }
+    return tools;
   }
 }
 

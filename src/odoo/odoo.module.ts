@@ -6,6 +6,7 @@ import { OdooController } from './odoo.controller.js';
 import { OdooProductsService } from './odoo-products.service.js';
 import { OdooTaxesService } from './odoo-taxes.service.js';
 import { OdooOperatorService } from './odoo-operator.service.js';
+import { OdooPaymentMethodsService } from './odoo-payment-methods.service.js';
 
 @Module({
   controllers: [OdooController],
@@ -16,6 +17,7 @@ import { OdooOperatorService } from './odoo-operator.service.js';
     OdooProductUpdateService,
     OdooTaxesService,
     OdooOperatorService,
+    OdooPaymentMethodsService,
   ],
   exports: [
     OdooClientService,
@@ -24,6 +26,7 @@ import { OdooOperatorService } from './odoo-operator.service.js';
     OdooProductUpdateService,
     OdooTaxesService,
     OdooOperatorService,
+    OdooPaymentMethodsService,
   ],
 })
 export class OdooModule {}

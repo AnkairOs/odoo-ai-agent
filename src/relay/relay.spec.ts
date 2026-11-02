@@ -326,7 +326,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
     expect(sender.sent).toEqual([{ to: OPERATOR, body: 'Hola. Puedo conversar contigo; no hay operaciones Odoo disponibles.' }]);
     expect(ai.conversationCalls).toHaveLength(1);
     expect((ai.conversationCalls[0] as { approvalRequiredTools: string[] }).approvalRequiredTools)
-      .toEqual(['draft_customer_reply', 'create_product', 'update_product', 'archive_product']);
+      .toEqual(['draft_customer_reply', 'create_product', 'update_product', 'archive_product', 'create_payment_method', 'update_payment_method', 'archive_payment_method']);
     expect(ai.toolCalls).toHaveLength(0);
     expect(app.get(RelayStore).findOpenForCustomer(OPERATOR)).toBeUndefined();
   });
@@ -1600,6 +1600,7 @@ describe('WhatsApp operator relay (POST /webhooks/kapso)', () => {
       );
       expect(Object.keys(ai.toolCalls[0]?.tools ?? {}).sort()).toEqual([
         'get_customer_history',
+        'get_payment_methods',
         'search_odoo_products',
         'search_past_answers',
       ]);
