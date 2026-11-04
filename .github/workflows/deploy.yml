@@ -48,6 +48,7 @@ jobs:
           script: |
             set -e
             echo "🚀 Actualizando odoo-ai-agent en servidor VPS..."
+            git config --global --add safe.directory /home/oscar/workspace/odoo-ai-agent || true
             cd /home/oscar/workspace/odoo-ai-agent
             git pull origin main
             docker compose down || true
