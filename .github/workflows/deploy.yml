@@ -1,4 +1,4 @@
-name: CI and Deploy odoo-ai-agent to Contabo VPS
+name: CI and Deploy odoo-ai-agent to Production VPS
 
 on:
   push:
@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy to Contabo VPS via SSH
+      - name: Deploy to Leaseweb VPS via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -48,7 +48,7 @@ jobs:
           script: |
             set -e
             echo "🚀 Actualizando odoo-ai-agent en servidor VPS..."
-            cd /opt/odoo-ai-agent
+            cd /home/oscar/workspace/odoo-ai-agent
             git pull origin main
             docker compose down || true
             docker compose up -d --build --remove-orphans
